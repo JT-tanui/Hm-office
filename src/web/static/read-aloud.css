@@ -1,0 +1,16 @@
+/* Read Aloud Button */
+.read-aloud-btn {
+    padding: 4px 10px;
+    font-size: 0.75rem;
+    background-color: #45475a;
+    color: var(--text-color);
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: 0.2s;
+}
+
+.read-aloud-btn:hover {
+    background-color: var(--accent-color);
+    color: white;
+}

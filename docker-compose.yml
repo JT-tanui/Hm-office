@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    ports:
+      - "5000:5000"
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - FLASK_ENV=development
+    volumes:
+      - ./conversations.db:/app/conversations.db
+      - ./src/web/static/audio:/app/src/web/static/audio
+    networks:
+      - tanui-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:5000
+    depends_on:
+      - backend
+    networks:
+      - tanui-network
+
+networks:
+  tanui-network:
+    driver: bridge
+
+volumes:
+  conversations-data:
+  audio-data:
