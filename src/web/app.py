@@ -5,6 +5,7 @@ import base64
 import numpy as np
 import urllib.request
 from flask import Flask, render_template, request, jsonify, send_from_directory
+from werkzeug.utils import secure_filename
 
 # Add src to path so we can import assistant modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -18,6 +19,16 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder="static", template_folder=".")
+
+# Configure uploads
+UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), 'static', 'uploads', 'memos')
+ALLOWED_EXTENSIONS = {'wav', 'mp3', 'webm', 'ogg', 'm4a'}
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 # Initialize pipeline
 pipeline = AssistantPipeline()
@@ -526,38 +537,6 @@ def get_voices():
         if os.path.exists(voice_dir):
             voices = [f.replace(".json", "") for f in os.listdir(voice_dir) if f.endswith(".json")]
             return jsonify({"voices": sorted(voices)})
-    return jsonify({"voices": []})
-
-# ============= Conversation API Endpoints =============
-
-@app.route("/api/conversations", methods=["GET"])
-def get_conversations_api():
-    """Get all conversations"""
-    try:
-        conversations = db.get_conversations()
-        return jsonify({"conversations": conversations})
-    except Exception as e:
-        logger.error(f"Failed to get conversations: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/conversations", methods=["POST"])
-def create_conversation_api():
-    """Create a new conversation"""
-    try:
-        data = request.json
-        conversation_id = data.get("id")
-        title = data.get("title", "New Chat")
-        
-        if not conversation_id:
-            return jsonify({"error": "id is required"}), 400
-        
-        conversation = db.create_conversation(conversation_id, title)
-        return jsonify(conversation)
-    except Exception as e:
-        logger.error(f"Failed to create conversation: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/conversations/<conversation_id>", methods=["GET"])
 def get_conversation_api(conversation_id):
     """Get a single conversation with messages"""
     try:
@@ -631,6 +610,357 @@ def add_message_api(conversation_id):
         return jsonify(message)
     except Exception as e:
         logger.error(f"Failed to add message: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/search", methods=["GET"])
+def search_messages_api():
+    """Full-text search across all messages"""
+    try:
+        query = request.args.get("q", "")
+        limit = int(request.args.get("limit", 50))
+        
+        if not query:
+            return jsonify({"results": []}), 200
+        
+        results = db.search_messages(query, limit)
+        return jsonify({"results": results, "query": query, "count": len(results)})
+    except Exception as e:
+        logger.error(f"Search failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/conversations/filter", methods=["GET"])
+def filter_conversations_api():
+    """Filter conversations by date and/or model"""
+    try:
+        start_date = request.args.get("start_date", type=int)
+        end_date = request.args.get("end_date", type=int)
+        model = request.args.get("model")
+        
+        results = db.filter_conversations(start_date, end_date, model)
+        return jsonify({"conversations": results, "count": len(results)})
+    except Exception as e:
+        logger.error(f"Filter failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# Tag Management Endpoints
+@app.route("/api/tags", methods=["GET"])
+def get_tags_api():
+    """Get all tags"""
+    try:
+        tags = db.get_tags()
+        return jsonify({"tags": tags})
+    except Exception as e:
+        logger.error(f"Failed to get tags: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/tags", methods=["POST"])
+def create_tag_api():
+    """Create a new tag"""
+    try:
+        data = request.json
+        tag_id = data.get("id")
+        name = data.get("name")
+        color = data.get("color", "#3B82F6")
+        icon = data.get("icon", "🏷️")
+        
+        if not all([tag_id, name]):
+            return jsonify({"error": "id and name are required"}), 400
+        
+        tag = db.create_tag(tag_id, name, color, icon)
+        if not tag:
+            return jsonify({"error": "Tag with this name already exists"}), 409
+        
+        return jsonify(tag), 201
+    except Exception as e:
+        logger.error(f"Failed to create tag: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/tags/<tag_id>", methods=["DELETE"])
+def delete_tag_api(tag_id):
+    """Delete a tag"""
+    try:
+        success = db.delete_tag(tag_id)
+        if not success:
+            return jsonify({"error": "Tag not found"}), 404
+        
+        return jsonify({"success": True})
+    except Exception as e:
+        logger.error(f"Failed to delete tag: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/conversations/<conversation_id>/tags", methods=["POST"])
+def add_tag_to_conversation_api(conversation_id):
+    """Add a tag to a conversation"""
+    try:
+        data = request.json
+        tag_id = data.get("tag_id")
+        
+        if not tag_id:
+            return jsonify({"error": "tag_id is required"}), 400
+        
+        success = db.add_tag_to_conversation(conversation_id, tag_id)
+        if not success:
+            return jsonify({"error": "Tag already added or not found"}), 409
+        
+        return jsonify({"success": True})
+    except Exception as e:
+        logger.error(f"Failed to add tag: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/conversations/<conversation_id>/tags/<tag_id>", methods=["DELETE"])
+def remove_tag_from_conversation_api(conversation_id, tag_id):
+    """Remove a tag from a conversation"""
+    try:
+        success = db.remove_tag_from_conversation(conversation_id, tag_id)
+        if not success:
+            return jsonify({"error": "Tag not found on conversation"}), 404
+        
+        return jsonify({"success": True})
+    except Exception as e:
+        logger.error(f"Failed to remove tag: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/conversations/<conversation_id>/tags", methods=["GET"])
+def get_conversation_tags_api(conversation_id):
+    """Get all tags for a conversation"""
+    try:
+        tags = db.get_conversation_tags(conversation_id)
+        return jsonify({"tags": tags})
+    except Exception as e:
+        logger.error(f"Failed to get tags: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/conversations/<conversation_id>/pin", methods=["PATCH"])
+def pin_conversation_api(conversation_id):
+    """Pin or unpin a conversation"""
+    try:
+        data = request.json
+        pinned = data.get("pinned", True)
+        
+        success = db.pin_conversation(conversation_id, pinned)
+        if not success:
+            return jsonify({"error": "Conversation not found"}), 404
+        
+        return jsonify({"success": True, "pinned": pinned})
+    except Exception as e:
+        logger.error(f"Failed to pin conversation: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/conversations/<conversation_id>/archive", methods=["PATCH"])
+def archive_conversation_api(conversation_id):
+    """Archive or unarchive a conversation"""
+    try:
+        data = request.json
+        archived = data.get("archived", True)
+        
+        success = db.archive_conversation(conversation_id, archived)
+        if not success:
+            return jsonify({"error": "Conversation not found"}), 404
+        
+        return jsonify({"success": True, "archived": archived})
+    except Exception as e:
+        logger.error(f"Failed to archive conversation: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# Voice Memos API
+
+@app.route("/api/voice-memos", methods=["GET"])
+def get_voice_memos():
+    """Get recent voice memos"""
+    try:
+        limit = int(request.args.get("limit", 50))
+        offset = int(request.args.get("offset", 0))
+        profile_id = request.headers.get('X-Profile-ID', 'default')
+        memos = db.get_voice_memos(profile_id=profile_id, limit=limit, offset=offset)
+        return jsonify({"memos": memos})
+    except Exception as e:
+        logger.error(f"Failed to get voice memos: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/voice-memos", methods=["POST"])
+def create_voice_memo():
+    """Create a new voice memo (upload audio)"""
+    try:
+        if 'audio' not in request.files:
+            return jsonify({"error": "No audio file provided"}), 400
+            
+        file = request.files['audio']
+        if file.filename == '':
+            return jsonify({"error": "No selected file"}), 400
+            
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            # Add timestamp to filename to prevent collisions
+            timestamp = int(datetime.now().timestamp())
+            unique_filename = f"{timestamp}_{filename}"
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+            file.save(filepath)
+            
+            # Relative path for frontend
+            relative_path = f"/static/uploads/memos/{unique_filename}"
+            
+            title = request.form.get('title', f"Voice Memo {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+            duration = float(request.form.get('duration', 0))
+            transcription = request.form.get('transcription', "")
+            profile_id = request.headers.get('X-Profile-ID', 'default')
+            
+            # Parse tags if provided
+            tags_json = request.form.get('tags', '[]')
+            try:
+                tags = json_module.loads(tags_json)
+            except:
+                tags = []
+            
+            memo_id = db.create_voice_memo(title, relative_path, transcription, duration, tags, profile_id=profile_id)
+            
+            return jsonify({
+                "success": True, 
+                "memo": {
+                    "id": memo_id,
+                    "title": title,
+                    "audio_path": relative_path,
+                    "transcription": transcription,
+                    "duration": duration,
+                    "tags": tags,
+                    "created_at": timestamp,
+                    "profile_id": profile_id
+                }
+            }), 201
+            
+        return jsonify({"error": "File type not allowed"}), 400
+    except Exception as e:
+        logger.error(f"Failed to create voice memo: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/voice-memos/<memo_id>", methods=["GET"])
+def get_voice_memo(memo_id):
+    """Get a specific voice memo"""
+    try:
+        memo = db.get_voice_memo(memo_id)
+        if not memo:
+            return jsonify({"error": "Memo not found"}), 404
+        return jsonify({"memo": memo})
+    except Exception as e:
+        logger.error(f"Failed to get voice memo: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/voice-memos/<memo_id>", methods=["DELETE"])
+def delete_voice_memo(memo_id):
+    """Delete a voice memo"""
+    try:
+        # Get memo to find file path
+        memo = db.get_voice_memo(memo_id)
+        if not memo:
+            return jsonify({"error": "Memo not found"}), 404
+            
+        # Delete from DB
+        success = db.delete_voice_memo(memo_id)
+        
+        # Delete file if exists
+        if success and memo.get('audio_path'):
+            # Convert relative path back to absolute
+            filename = os.path.basename(memo['audio_path'])
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            if os.path.exists(filepath):
+                os.remove(filepath)
+                
+        return jsonify({"success": success})
+    except Exception as e:
+        logger.error(f"Failed to delete voice memo: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/voice-memos/search", methods=["GET"])
+def search_voice_memos():
+    """Search voice memos"""
+    try:
+        query = request.args.get("q", "")
+        limit = int(request.args.get("limit", 20))
+        
+        if not query:
+            return jsonify({"results": []})
+            
+        results = db.search_voice_memos(query, limit)
+        return jsonify({"results": results})
+    except Exception as e:
+        logger.error(f"Failed to search voice_memos: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# Profile API
+
+@app.route("/api/profiles", methods=["GET"])
+def get_profiles():
+    """Get all profiles"""
+    try:
+        profiles = db.get_profiles()
+        return jsonify({"profiles": profiles})
+    except Exception as e:
+        logger.error(f"Failed to get profiles: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/profiles", methods=["POST"])
+def create_profile():
+    """Create a new profile"""
+    try:
+        data = request.json
+        name = data.get("name")
+        if not name:
+            return jsonify({"error": "Name is required"}), 400
+            
+        avatar_path = data.get("avatar_path", "")
+        profile_id = db.create_profile(name, avatar_path)
+        
+        return jsonify({"success": True, "id": profile_id, "name": name}), 201
+    except Exception as e:
+        logger.error(f"Failed to create profile: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/profiles/<profile_id>", methods=["GET"])
+def get_profile(profile_id):
+    """Get a specific profile"""
+    try:
+        profile = db.get_profile(profile_id)
+        if not profile:
+            return jsonify({"error": "Profile not found"}), 404
+        return jsonify({"profile": profile})
+    except Exception as e:
+        logger.error(f"Failed to get profile: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/profiles/<profile_id>", methods=["DELETE"])
+def delete_profile(profile_id):
+    """Delete a profile"""
+    try:
+        if profile_id == 'default':
+            return jsonify({"error": "Cannot delete default profile"}), 400
+            
+        success = db.delete_profile(profile_id)
+        if not success:
+            return jsonify({"error": "Profile not found"}), 404
+            
+        return jsonify({"success": True})
+    except Exception as e:
+        logger.error(f"Failed to delete profile: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/profiles/<profile_id>/settings", methods=["GET"])
+def get_profile_settings(profile_id):
+    """Get settings for a profile"""
+    try:
+        settings = db.get_profile_settings(profile_id)
+        return jsonify({"settings": settings})
+    except Exception as e:
+        logger.error(f"Failed to get profile settings: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/profiles/<profile_id>/settings", methods=["PUT"])
+def update_profile_settings(profile_id):
+    """Update settings for a profile"""
+    try:
+        settings = request.json
+        success = db.update_profile_settings(profile_id, settings)
+        return jsonify({"success": success})
+    except Exception as e:
+        logger.error(f"Failed to update profile settings: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
