@@ -2,16 +2,31 @@ import os
 import sys
 import logging
 import base64
+import json as json_module
+import sqlite3
 import numpy as np
 import urllib.request
-from flask import Flask, render_template, request, jsonify, send_from_directory
+import urllib.parse
+from datetime import datetime
+from flask import Flask, render_template, request, jsonify, send_from_directory, redirect
 from werkzeug.utils import secure_filename
+import tempfile
+import zipfile
+import requests
 
 # Add src to path so we can import assistant modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from assistant.pipeline import AssistantPipeline
 from assistant.config import MODEL_PREFERENCES
+from assistant.integrations.manager import IntegrationManager
+from assistant.integrations.dummy import DummyIntegration
+from assistant.integrations.notion import NotionIntegration
+from assistant.integrations.google_drive import GoogleDriveIntegration
+from assistant.integrations.google_keep import GoogleKeepIntegration
+from assistant.integrations.microsoft_graph import MicrosoftGraphIntegration
+from assistant.integrations.trello import TrelloIntegration
+from assistant.integrations.asana import AsanaIntegration
 from database import ConversationDB
 
 # Setup logging
@@ -22,13 +37,162 @@ app = Flask(__name__, static_folder="static", template_folder=".")
 
 # Configure uploads
 UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), 'static', 'uploads', 'memos')
-ALLOWED_EXTENSIONS = {'wav', 'mp3', 'webm', 'ogg', 'm4a'}
+VOICE_UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), 'static', 'uploads', 'voices')
+WAKE_SOUND_FOLDER = os.path.join(os.path.dirname(__file__), 'static', 'uploads', 'wake_sounds')
+ALLOWED_EXTENSIONS = {'wav', 'mp3', 'webm', 'ogg', 'm4a', 'txt', 'md', 'markdown', 'zip', 'pdf', 'docx'}
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(VOICE_UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(WAKE_SOUND_FOLDER, exist_ok=True)
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['VOICE_UPLOAD_FOLDER'] = VOICE_UPLOAD_FOLDER
+app.config['WAKE_SOUND_FOLDER'] = WAKE_SOUND_FOLDER
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def _extract_text_from_file(path: str) -> list:
+    """Return list of (name, text) from a file path (txt/md/pdf/docx)."""
+    texts = []
+    ext = os.path.splitext(path)[1].lower()
+    if ext in ['.txt', '.md', '.markdown']:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            texts.append((os.path.basename(path), f.read()))
+    elif ext == '.pdf':
+        try:
+            import PyPDF2
+            reader = PyPDF2.PdfReader(path)
+            content = "\n".join([page.extract_text() or "" for page in reader.pages])
+            texts.append((os.path.basename(path), content))
+        except Exception as e:
+            logger.warning(f"PDF extraction failed for {path}: {e}")
+    elif ext == '.docx':
+        try:
+            import docx
+            document = docx.Document(path)
+            content = "\n".join([p.text for p in document.paragraphs])
+            texts.append((os.path.basename(path), content))
+        except Exception as e:
+            logger.warning(f"DOCX extraction failed for {path}: {e}")
+    return texts
+
+def _chunk_text_for_rag(text: str, max_len: int = 800) -> list:
+    chunks = []
+    buffer = []
+    length = 0
+    for line in text.splitlines():
+        if length + len(line) > max_len and buffer:
+            chunks.append("\n".join(buffer))
+            buffer = []
+            length = 0
+        buffer.append(line)
+        length += len(line)
+    if buffer:
+        chunks.append("\n".join(buffer))
+    return chunks
+
+def _hash_embed(text: str, dim: int = 256) -> list:
+    import hashlib
+    vec = [0.0] * dim
+    for token in text.lower().split():
+        h = int(hashlib.sha256(token.encode('utf-8')).hexdigest(), 16)
+        idx = h % dim
+        vec[idx] += 1.0
+    # L2 normalize
+    import math
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / norm for v in vec]
+
+def _get_embedding(text: str) -> list:
+    from openai import OpenAI
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    client = OpenAI(api_key=api_key)
+    resp = client.embeddings.create(model="text-embedding-3-small", input=text[:6000])
+    return resp.data[0].embedding
+
+def semantic_rank(query: str, chunks: list, top_k: int = 5) -> list:
+    q_vec = None
+    try:
+        q_vec = _get_embedding(query)
+    except Exception as e:
+        logger.warning(f"Embedding query failed, falling back to hash: {e}")
+        q_vec = _hash_embed(query)
+    scored = []
+    for row in chunks:
+        emb = row.get("embedding")
+        if emb:
+            try:
+                import json as _json
+                c_vec = _json.loads(emb)
+            except Exception:
+                c_vec = None
+        else:
+            c_vec = None
+        if not c_vec:
+            try:
+                c_vec = _get_embedding(row.get("content", ""))
+            except Exception:
+                c_vec = _hash_embed(row.get("content", ""))
+        score = sum(q * c for q, c in zip(q_vec, c_vec))
+        scored.append((score, row))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [row for score, row in scored[:top_k] if score > 0]
+
+def get_web_search_context(query: str, limit: int = 3) -> str:
+    """Lightweight DuckDuckGo search helper."""
+    try:
+        params = urllib.parse.urlencode({
+            "q": query,
+            "format": "json",
+            "no_redirect": "1",
+            "no_html": "1"
+        })
+        url = f"https://api.duckduckgo.com/?{params}"
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = json_module.loads(resp.read().decode("utf-8"))
+            topics = data.get("RelatedTopics", [])[:limit]
+            lines = []
+            for idx, item in enumerate(topics, start=1):
+                text = item.get("Text") or ""
+                link = item.get("FirstURL") or ""
+                if text or link:
+                    lines.append(f"{idx}. {text} ({link})")
+            if lines:
+                return "Web search results:\n" + "\n".join(lines)
+    except Exception as e:
+        logger.warning(f"Web search failed: {e}")
+    return ""
+
+def get_rag_context(query: str, profile_id: str, limit: int = 5, source_id: str = None) -> str:
+    """Retrieve top chunks for lightweight RAG (FS-backed or conversation search)."""
+    try:
+        # Semantic-ish search over recent chunks using hashed embeddings
+        recent = db.get_recent_rag_chunks(profile_id, limit=400)
+        if source_id:
+            recent = [r for r in recent if r.get("source_id") == source_id]
+        ranked = semantic_rank(query, recent, top_k=limit)
+        if not ranked:
+            # fallback to messages
+            results = db.search_messages(query, limit, profile_id=profile_id)
+            if not results:
+                return ""
+            lines = []
+            for idx, row in enumerate(results, start=1):
+                snippet = row.get("highlighted_content") or row.get("content") or ""
+                title = row.get("conversation_title") or "Conversation"
+                lines.append(f"{idx}. [{title}] {snippet}")
+            return "Knowledge base snippets:\n" + "\n".join(lines)
+
+        lines = []
+        for idx, row in enumerate(ranked, start=1):
+            snippet = row.get("snippet") or row.get("content") or ""
+            lines.append(f"{idx}. {snippet}")
+        return "Knowledge base snippets:\n" + "\n".join(lines)
+    except Exception as e:
+        logger.warning(f"RAG context failed: {e}")
+        return ""
 
 # Initialize pipeline
 pipeline = AssistantPipeline()
@@ -37,6 +201,16 @@ logger.info("Pipeline initialized successfully")
 # Initialize database
 db = ConversationDB()
 logger.info("Database initialized successfully")
+
+# Integrations
+integration_manager = IntegrationManager(db)
+integration_manager.register(DummyIntegration)
+integration_manager.register(NotionIntegration)
+integration_manager.register(GoogleDriveIntegration)
+integration_manager.register(GoogleKeepIntegration)
+integration_manager.register(MicrosoftGraphIntegration)
+integration_manager.register(TrelloIntegration)
+integration_manager.register(AsanaIntegration)
 
 @app.route("/")
 def index():
@@ -54,9 +228,19 @@ def chat():
     api_key = data.get("api_key")
     system_prompt = data.get("system_prompt")  # System instructions
     conversation_history = data.get("conversation_history", [])  # Get conversation history
+    temperature = float(data.get("temperature", 0.7))
+    use_web_search = data.get("use_web_search", False)
+    use_rag = data.get("use_rag", False)
+    rag_source_id = data.get("rag_source_id")
+    rag_source_id = data.get("rag_source_id")
+    tone = data.get("tone")
+    profile_id = request.headers.get("X-Profile-ID", "default")
 
     if not user_input:
         return jsonify({"error": "No text provided"}), 400
+
+    if tone:
+        system_prompt = (system_prompt or "") + f"\nTone preference: {tone}"
 
     # Build conversation context if history exists
     if conversation_history:
@@ -76,6 +260,19 @@ def chat():
     else:
         full_context = user_input
 
+    # Tool contexts (web search + RAG)
+    tool_contexts = []
+    if use_web_search:
+        search_ctx = get_web_search_context(user_input)
+        if search_ctx:
+            tool_contexts.append(search_ctx)
+    if use_rag:
+        rag_ctx = get_rag_context(user_input, profile_id, source_id=rag_source_id)
+        if rag_ctx:
+            tool_contexts.append(rag_ctx)
+    if tool_contexts:
+        full_context = "\n\n".join(tool_contexts) + "\n\nUser query:\n" + full_context
+
     result = pipeline.generate_response(
         full_context, 
         model_preference, 
@@ -83,7 +280,8 @@ def chat():
         voice_speed=voice_speed,
         provider=provider,
         api_key=api_key,
-        system_prompt=system_prompt
+        system_prompt=system_prompt,
+        temperature=temperature
     )
     
     response_data = {
@@ -144,7 +342,6 @@ def chat():
 def chat_stream():
     """True streaming - streams LLM response and generates audio per sentence"""
     from flask import Response, stream_with_context
-    import json as json_module
     
     data = request.json
     user_input = data.get("text")
@@ -157,12 +354,18 @@ def chat_stream():
     conversation_history = data.get("conversation_history", [])  # Get conversation history
     conversation_id = data.get("conversation_id")  # Get current conversation ID
     use_cross_context = data.get("use_cross_context", True)  # Enable cross-context by default
+    use_web_search = data.get("use_web_search", False)
+    use_rag = data.get("use_rag", False)
+    tone = data.get("tone")
+    temperature = float(data.get("temperature", 0.7))
+    profile_id = request.headers.get("X-Profile-ID", "default")
 
     if not user_input:
         return jsonify({"error": "No text provided"}), 400
 
     def generate():
         try:
+            local_system = system_prompt
             # Log all incoming parameters for debugging
             logger.info(f"=== STREAM REQUEST START ===")
             logger.info(f"User input: {user_input[:100]}...")
@@ -189,6 +392,9 @@ def chat_stream():
                     max_context_chars = 4000    # Reduced from 6000 (Conservative)
             
             logger.info(f"Dynamic context limit for {model_preference}: {max_context_chars} chars")
+
+            if tone:
+                local_system = (local_system or "") + f"\nTone preference: {tone}"
 
             # Build conversation context with budget
             context_parts = []
@@ -222,7 +428,11 @@ def chat_stream():
             if use_cross_context and conversation_id and current_chars < (max_context_chars * 0.7):
                 try:
                     # Fetch more candidates, but only use what fits
-                    cross_messages = db.get_all_context_messages(exclude_id=conversation_id, limit=20)
+                    cross_messages = db.get_all_context_messages(
+                        exclude_id=conversation_id,
+                        limit=20,
+                        profile_id=profile_id
+                    )
                     if cross_messages:
                         cross_context = []
                         for msg in cross_messages:
@@ -248,6 +458,18 @@ def chat_stream():
             
             # Add current user input at the end
             context_parts.append(f"\nUser: {user_input}")
+
+            # Tooling contexts
+            if use_web_search:
+                search_ctx = get_web_search_context(user_input)
+                if search_ctx:
+                    context_parts.insert(0, "# Web search results")
+                    context_parts.insert(1, search_ctx)
+            if use_rag:
+                rag_ctx = get_rag_context(user_input, profile_id, source_id=rag_source_id)
+                if rag_ctx:
+                    context_parts.insert(0, "# Retrieved knowledge")
+                    context_parts.insert(1, rag_ctx)
             
             # Build final context
             if context_parts:
@@ -275,7 +497,14 @@ def chat_stream():
                     return
                 
                 client = OpenRouterClient(api_key)
-                stream = client.stream_generate(full_context, model=model_preference, system=system_prompt)
+                stream = client.stream_generate(full_context, model=model_preference, system=local_system, temperature=temperature)
+            elif provider == "openai":
+                from assistant.llm import OpenAIClient
+                if not api_key:
+                    yield f"data: {json_module.dumps({'type': 'error', 'message': 'OpenAI API key required'})}\n\n"
+                    return
+                client = OpenAIClient(api_key)
+                stream = client.stream_generate(full_context, model=model_preference, system=local_system, temperature=temperature)
             else:  # Ollama
                 # Map preference key to actual model name if it exists in config
                 from assistant.config import MODEL_PREFERENCES
@@ -285,7 +514,12 @@ def chat_stream():
                 if actual_model != model_preference:
                     logger.info(f"Mapped model preference '{model_preference}' to '{actual_model}'")
                 
-                stream = pipeline.llm.ollama_client.stream_generate(full_context, model=actual_model, system=system_prompt)
+                stream = pipeline.llm.ollama_client.stream_generate(
+                    full_context,
+                    model=actual_model,
+                    system=local_system,
+                    options={"temperature": temperature}
+                )
             
             # Process each sentence from LLM
             for sentence in stream:
@@ -398,8 +632,15 @@ def get_config():
 def get_settings_api():
     """Get user settings"""
     try:
+        profile_id = request.headers.get("X-Profile-ID", "default")
         settings = db.get_settings()
-        return jsonify(settings)
+        profile_settings = db.get_profile_settings(profile_id)
+        merged = {
+            **settings,
+            "wake_word_sensitivity": profile_settings.get("wake_word_sensitivity", 0.7),
+            "activation_sound_path": profile_settings.get("activation_sound_path")
+        }
+        return jsonify(merged)
     except Exception as e:
         logger.error(f"Failed to get settings: {e}")
         return jsonify({"error": str(e)}), 500
@@ -408,10 +649,20 @@ def get_settings_api():
 def update_settings_api():
     """Update user settings"""
     try:
-        data = request.json
-        success = db.update_settings(data)
-        if success:
-            return jsonify({"success": True, "settings": db.get_settings()})
+        data = request.json or {}
+        profile_id = request.headers.get("X-Profile-ID", "default")
+        success_global = db.update_settings(data)
+        profile_updates = {}
+        for key in ["voice_style", "voice_speed", "auto_speak", "wake_word_enabled", "wake_word_sensitivity", "activation_sound_path"]:
+            if key in data and data.get(key) is not None:
+                profile_updates[key] = data.get(key)
+        profile_success = db.update_profile_settings(profile_id, profile_updates) if profile_updates else False
+        if success_global or profile_success:
+            merged = db.get_settings()
+            profile_settings = db.get_profile_settings(profile_id)
+            merged["wake_word_sensitivity"] = profile_settings.get("wake_word_sensitivity", 0.7)
+            merged["activation_sound_path"] = profile_settings.get("activation_sound_path")
+            return jsonify({"success": True, "settings": merged})
         else:
             return jsonify({"error": "Failed to update settings"}), 500
     except Exception as e:
@@ -454,6 +705,15 @@ def get_models():
                     {"id": "google/gemini-pro", "name": "Gemini Pro"}
                 ]
             })
+    elif provider == "openai":
+        # Return common OpenAI chat models
+        return jsonify({
+            "models": [
+                {"id": "gpt-4o-mini", "name": "GPT-4o Mini"},
+                {"id": "gpt-4o", "name": "GPT-4o"},
+                {"id": "gpt-3.5-turbo", "name": "GPT-3.5 Turbo"}
+            ]
+        })
     else:  # ollama
         # Fetch from ollama list command
         try:
@@ -488,13 +748,72 @@ def get_models():
                 from assistant.config import MODEL_PREFERENCES
                 models = [{"id": k, "name": k} for k in MODEL_PREFERENCES.keys()]
                 logger.info(f"Using fallback models: {models}")
-                return jsonify({"models": models})
+            return jsonify({"models": models})
         except Exception as e:
             logger.error(f"Failed to fetch Ollama models: {e}")
             # Fallback to config
             from assistant.config import MODEL_PREFERENCES
             models = [{"id": k, "name": k} for k in MODEL_PREFERENCES.keys()]
             return jsonify({"models": models})
+
+# Wake Word Management
+@app.route("/api/wake-words", methods=["GET", "POST"])
+def wake_words_api():
+    profile_id = request.headers.get("X-Profile-ID", "default")
+    try:
+        if request.method == "GET":
+            wake_words = db.get_wake_words(profile_id)
+            return jsonify({"wake_words": wake_words})
+
+        data = request.json or {}
+        word = data.get("word")
+        if not word:
+            return jsonify({"error": "word is required"}), 400
+        new_word = db.add_wake_word(profile_id, word)
+        return jsonify(new_word), 201
+    except Exception as e:
+        logger.error(f"Wake word error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/wake-words/<wake_word_id>", methods=["DELETE"])
+def delete_wake_word_api(wake_word_id):
+    try:
+        success = db.delete_wake_word(wake_word_id)
+        if not success:
+            return jsonify({"error": "Wake word not found"}), 404
+        return jsonify({"success": True})
+    except Exception as e:
+        logger.error(f"Failed to delete wake word: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/wake-words/activation-sound", methods=["POST"])
+def upload_activation_sound():
+    """Upload a custom wake-word activation sound and store path in profile settings"""
+    try:
+        profile_id = request.headers.get("X-Profile-ID", "default")
+        if 'file' not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({"error": "No selected file"}), 400
+
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            unique = f"{int(datetime.now().timestamp())}_{filename}"
+            filepath = os.path.join(app.config['WAKE_SOUND_FOLDER'], unique)
+            file.save(filepath)
+
+            relative_path = f"/static/uploads/wake_sounds/{unique}"
+            # Persist to profile settings
+            db.update_profile_settings(profile_id, {"activation_sound_path": relative_path})
+
+            return jsonify({"success": True, "path": relative_path}), 201
+
+        return jsonify({"error": "File type not allowed"}), 400
+    except Exception as e:
+        logger.error(f"Failed to upload activation sound: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/conversation-styles", methods=["GET"])
 def get_conversation_styles():
@@ -537,6 +856,55 @@ def get_voices():
         if os.path.exists(voice_dir):
             voices = [f.replace(".json", "") for f in os.listdir(voice_dir) if f.endswith(".json")]
             return jsonify({"voices": sorted(voices)})
+    return jsonify({"voices": []})
+
+@app.route("/api/voice-profiles", methods=["GET", "POST"])
+def voice_profiles():
+    """List or create voice profiles (metadata only)"""
+    if request.method == "GET":
+        try:
+            profiles = db.list_voice_profiles()
+            return jsonify({"profiles": profiles})
+        except Exception as e:
+            logger.error(f"Failed to list voice profiles: {e}")
+            return jsonify({"error": str(e)}), 500
+    else:
+        try:
+            payload_json = request.json if request.is_json else None
+            name = (payload_json or {}).get("name") if payload_json else request.form.get("name")
+            description = (payload_json or {}).get("description", "") if payload_json else request.form.get("description", "")
+            provider = (payload_json or {}).get("provider", "supertonic") if payload_json else request.form.get("provider", "supertonic")
+            cloned = (payload_json or {}).get("cloned", False) if payload_json else request.form.get("cloned", "0")
+            sample_path = ""
+
+            if not payload_json and 'sample' in request.files:
+                file = request.files['sample']
+                if file and allowed_file(file.filename):
+                    filename = secure_filename(file.filename)
+                    unique = f"{int(datetime.now().timestamp())}_{filename}"
+                    filepath = os.path.join(app.config['VOICE_UPLOAD_FOLDER'], unique)
+                    file.save(filepath)
+                    sample_path = f"/static/uploads/voices/{unique}"
+
+            if not name:
+                return jsonify({"error": "Name required"}), 400
+
+            voice_id = db.create_voice_profile(name, description, sample_path, provider, cloned in [True, "1", "true"])
+            return jsonify({
+                "success": True,
+                "voice": {
+                    "id": voice_id,
+                    "name": name,
+                    "description": description,
+                    "sample_path": sample_path,
+                    "provider": provider,
+                    "cloned": cloned in [True, "1", "true"]
+                }
+            }), 201
+        except Exception as e:
+            logger.error(f"Failed to create voice profile: {e}")
+            return jsonify({"error": str(e)}), 500
+
 def get_conversation_api(conversation_id):
     """Get a single conversation with messages"""
     try:
@@ -580,6 +948,20 @@ def toggle_context_api(conversation_id):
         logger.error(f"Failed to toggle context: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/conversations/<conversation_id>/folder", methods=["PATCH"])
+def set_conversation_folder(conversation_id):
+    """Assign or clear a folder on a conversation"""
+    try:
+        data = request.json or {}
+        folder_id = data.get("folder_id")
+        success = db.set_conversation_folder(conversation_id, folder_id)
+        if not success:
+            return jsonify({"error": "Conversation not found"}), 404
+        return jsonify({"success": True, "folder_id": folder_id})
+    except Exception as e:
+        logger.error(f"Failed to set folder: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/conversations/<conversation_id>", methods=["DELETE"])
 def delete_conversation_api(conversation_id):
     """Delete a conversation"""
@@ -593,39 +975,194 @@ def delete_conversation_api(conversation_id):
         logger.error(f"Failed to delete conversation: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route("/api/conversations/<conversation_id>/messages", methods=["POST"])
-def add_message_api(conversation_id):
-    """Add a message to a conversation"""
-    try:
-        data = request.json
-        message_id = data.get("id")
-        role = data.get("role")
-        content = data.get("content")
-        model = data.get("model")
-        
-        if not all([message_id, role, content]):
-            return jsonify({"error": "id, role, and content are required"}), 400
-        
-        message = db.add_message(message_id, conversation_id, role, content, model)
-        return jsonify(message)
-    except Exception as e:
-        logger.error(f"Failed to add message: {e}")
-        return jsonify({"error": str(e)}), 500
-
 @app.route("/api/search", methods=["GET"])
 def search_messages_api():
     """Full-text search across all messages"""
     try:
         query = request.args.get("q", "")
         limit = int(request.args.get("limit", 50))
+        profile_id = request.headers.get("X-Profile-ID", "default")
         
         if not query:
             return jsonify({"results": []}), 200
         
-        results = db.search_messages(query, limit)
+        results = db.search_messages(query, limit, profile_id=profile_id)
         return jsonify({"results": results, "query": query, "count": len(results)})
     except Exception as e:
         logger.error(f"Search failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# Integrations API
+@app.route("/api/integrations", methods=["GET"])
+def list_integrations():
+    """List available integrations and connection state for the current profile"""
+    try:
+        profile_id = request.headers.get("X-Profile-ID", "default")
+        available = integration_manager.get_available_integrations()
+        connected = db.get_integrations(profile_id)
+        connected_by_service = {item["service"]: item for item in connected}
+
+        merged = []
+        for item in available:
+            connected_item = connected_by_service.get(item["id"])
+            connect_url = None
+            if item["id"] == "notion":
+                host = request.host_url.rstrip('/')
+                callback = f"{host}/api/integrations/callback/notion"
+                connect_url = NotionIntegration("dummy").get_auth_url(callback) + f"&state={profile_id}"
+            if item["id"] == "google_drive":
+                host = request.host_url.rstrip('/')
+                callback = f"{host}/api/integrations/callback/google_drive"
+                connect_url = GoogleDriveIntegration("dummy").get_auth_url(callback) + f"&state={profile_id}"
+            merged.append({
+                **item,
+                "connected": connected_item is not None,
+                "connected_at": connected_item.get("created_at") if connected_item else None,
+                "integration_id": connected_item.get("id") if connected_item else None,
+                "config": connected_item.get("config") if connected_item else {},
+                "connect_url": connect_url
+            })
+        return jsonify({"integrations": merged})
+    except Exception as e:
+        logger.error(f"Failed to list integrations: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/integrations/connect", methods=["POST"])
+def connect_integration():
+    """Create or update an integration connection"""
+    try:
+        profile_id = request.headers.get("X-Profile-ID", "default")
+        data = request.json or {}
+        service = data.get("service")
+        config = data.get("config", {})
+        code = data.get("code")
+        redirect_uri = data.get("redirect_uri", "")
+        if not service:
+            return jsonify({"error": "service is required"}), 400
+
+        instance = integration_manager.get_integration_instance(service, profile_id)
+        if not instance:
+            return jsonify({"error": "Unknown integration"}), 404
+
+        tokens = {}
+        if hasattr(instance, "handle_callback"):
+            tokens = instance.handle_callback(code or "dummy_code", redirect_uri)
+
+        integration_id = db.create_integration(
+            profile_id,
+            service,
+            access_token=tokens.get("access_token"),
+            refresh_token=tokens.get("refresh_token"),
+            expires_at=tokens.get("expires_at"),
+            config=config
+        )
+        return jsonify({"success": True, "integration_id": integration_id}), 201
+    except Exception as e:
+        logger.error(f"Failed to connect integration: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/integrations/<integration_id>", methods=["DELETE"])
+def delete_integration_api(integration_id):
+    """Disconnect an integration"""
+    try:
+        success = db.delete_integration(integration_id)
+        if not success:
+            return jsonify({"error": "Integration not found"}), 404
+        return jsonify({"success": True})
+    except Exception as e:
+        logger.error(f"Failed to delete integration: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/integrations/callback/<service>")
+def integration_callback(service):
+    """OAuth callback for integrations"""
+    profile_id = request.args.get("state") or request.args.get("profile_id", "default")
+    code = request.args.get("code")
+    redirect_uri = request.base_url
+    instance = integration_manager.get_integration_instance(service, profile_id)
+    if not instance or not code:
+        return jsonify({"error": "Invalid callback"}), 400
+    tokens = instance.handle_callback(code, redirect_uri)
+    db.create_integration(
+        profile_id,
+        service,
+        access_token=tokens.get("access_token"),
+        refresh_token=tokens.get("refresh_token"),
+        expires_at=tokens.get("expires_at"),
+        config={}
+    )
+    return redirect("/?integration=success")
+
+# Notion actions
+def _get_integration_token(profile_id: str, service: str) -> str:
+    integrations = db.get_integrations(profile_id)
+    for item in integrations:
+        if item.get("service") == service:
+            return item.get("access_token")
+    return None
+
+@app.route("/api/integrations/notion/pages", methods=["GET", "POST"])
+def notion_pages():
+    profile_id = request.headers.get("X-Profile-ID", "default")
+    token = _get_integration_token(profile_id, "notion")
+    if not token:
+        return jsonify({"error": "Notion not connected"}), 400
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json"
+    }
+    try:
+        if request.method == "GET":
+            import requests
+            resp = requests.post("https://api.notion.com/v1/search", headers=headers, json={"page_size": 10}, timeout=15)
+            return jsonify(resp.json())
+        else:
+            data = request.json or {}
+            parent = data.get("parent_id")
+            title = data.get("title", "From Tanui")
+            if not parent:
+                return jsonify({"error": "parent_id required"}), 400
+            import requests
+            payload = {
+                "parent": {"page_id": parent},
+                "properties": {"title": {"title": [{"text": {"content": title}}]}},
+                "children": data.get("children", [])
+            }
+            resp = requests.post("https://api.notion.com/v1/pages", headers=headers, json=payload, timeout=15)
+            return jsonify(resp.json())
+    except Exception as e:
+        logger.error(f"Notion action failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/integrations/google_drive/upload", methods=["POST"])
+def google_drive_upload():
+    """Upload a text snippet to Google Drive"""
+    profile_id = request.headers.get("X-Profile-ID", "default")
+    token = _get_integration_token(profile_id, "google_drive")
+    if not token:
+        return jsonify({"error": "Google Drive not connected"}), 400
+    data = request.json or {}
+    content = data.get("content", "")
+    filename = data.get("filename", "tanui_note.txt")
+    try:
+        metadata = {"name": filename}
+        files = {
+            'data': ('metadata', json_module.dumps(metadata), 'application/json'),
+            'file': ('content', content, 'text/plain')
+        }
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.post(
+            "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",
+            headers=headers,
+            files=files,
+            timeout=15
+        )
+        if resp.status_code >= 300:
+            return jsonify({"error": "Upload failed", "details": resp.text}), 500
+        return jsonify({"success": True, "file": resp.json()})
+    except Exception as e:
+        logger.error(f"Drive upload failed: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/conversations/filter", methods=["GET"])
@@ -635,11 +1172,24 @@ def filter_conversations_api():
         start_date = request.args.get("start_date", type=int)
         end_date = request.args.get("end_date", type=int)
         model = request.args.get("model")
+        folder_id = request.args.get("folder_id")
+        profile_id = request.headers.get("X-Profile-ID", "default")
         
-        results = db.filter_conversations(start_date, end_date, model)
+        results = db.filter_conversations(start_date, end_date, model, profile_id=profile_id, folder_id=folder_id)
         return jsonify({"conversations": results, "count": len(results)})
     except Exception as e:
         logger.error(f"Filter failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/context/audit", methods=["GET"])
+def context_audit():
+    """List conversations used as context for a profile"""
+    try:
+        profile_id = request.headers.get("X-Profile-ID", "default")
+        data = db.get_context_audit(profile_id)
+        return jsonify({"conversations": data})
+    except Exception as e:
+        logger.error(f"Context audit failed: {e}")
         return jsonify({"error": str(e)}), 500
 
 # Tag Management Endpoints
@@ -688,6 +1238,38 @@ def delete_tag_api(tag_id):
         logger.error(f"Failed to delete tag: {e}")
         return jsonify({"error": str(e)}), 500
 
+# Folder Management
+@app.route("/api/folders", methods=["GET", "POST"])
+def folders_api():
+    try:
+        profile_id = request.headers.get("X-Profile-ID", "default")
+        if request.method == "GET":
+            folders = db.get_folders(profile_id)
+            return jsonify({"folders": folders})
+        data = request.json or {}
+        name = data.get("name")
+        color = data.get("color", "#64748b")
+        icon = data.get("icon", "📁")
+        if not name:
+            return jsonify({"error": "name is required"}), 400
+        folder = db.create_folder(profile_id, name, color, icon)
+        return jsonify(folder), 201
+    except Exception as e:
+        logger.error(f"Folder error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/folders/<folder_id>", methods=["DELETE"])
+def delete_folder(folder_id):
+    try:
+        profile_id = request.headers.get("X-Profile-ID", "default")
+        success = db.delete_folder(folder_id, profile_id)
+        if not success:
+            return jsonify({"error": "Folder not found"}), 404
+        return jsonify({"success": True})
+    except Exception as e:
+        logger.error(f"Failed to delete folder: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/conversations/<conversation_id>/tags", methods=["POST"])
 def add_tag_to_conversation_api(conversation_id):
     """Add a tag to a conversation"""
@@ -728,6 +1310,20 @@ def get_conversation_tags_api(conversation_id):
         return jsonify({"tags": tags})
     except Exception as e:
         logger.error(f"Failed to get tags: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/messages/<message_id>/pin", methods=["PATCH"])
+def pin_message_api(message_id):
+    """Pin or unpin a single message"""
+    try:
+        data = request.json or {}
+        pinned = data.get("pinned", True)
+        success = db.pin_message(message_id, pinned)
+        if not success:
+            return jsonify({"error": "Message not found"}), 404
+        return jsonify({"success": True, "pinned": pinned})
+    except Exception as e:
+        logger.error(f"Failed to pin message: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/conversations/<conversation_id>/pin", methods=["PATCH"])
@@ -885,6 +1481,82 @@ def search_voice_memos():
         logger.error(f"Failed to search voice_memos: {e}")
         return jsonify({"error": str(e)}), 500
 
+# RAG sources
+@app.route("/api/rag/sources", methods=["GET", "POST"])
+def rag_sources():
+    profile_id = request.headers.get("X-Profile-ID", "default")
+    if request.method == "GET":
+        try:
+            sources = db.list_rag_sources(profile_id)
+            return jsonify({"sources": sources})
+        except Exception as e:
+            logger.error(f"Failed to list RAG sources: {e}")
+            return jsonify({"error": str(e)}), 500
+
+    # POST - upload a file or zip
+    try:
+        if 'file' not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({"error": "No file selected"}), 400
+        name = request.form.get("name") or file.filename
+        source_id = str(int(datetime.now().timestamp() * 1000))
+        db.upsert_rag_source(source_id, profile_id, name, "upload", status="processing")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filepath = os.path.join(tmpdir, secure_filename(file.filename))
+            file.save(filepath)
+
+            texts = []
+            if zipfile.is_zipfile(filepath):
+                with zipfile.ZipFile(filepath, 'r') as zf:
+                    for member in zf.namelist():
+                        if member.endswith('/'):
+                            continue
+                        if not any(member.lower().endswith(ext) for ext in ['.txt', '.md', '.markdown', '.pdf', '.docx']):
+                            continue
+                        with zf.open(member) as f:
+                            try:
+                                extracted_path = os.path.join(tmpdir, secure_filename(member))
+                                os.makedirs(os.path.dirname(extracted_path), exist_ok=True)
+                                with open(extracted_path, 'wb') as out:
+                                    out.write(f.read())
+                                texts.extend(_extract_text_from_file(extracted_path))
+                            except Exception as e:
+                                logger.warning(f"Skip {member}: {e}")
+            else:
+                if not any(filepath.lower().endswith(ext) for ext in ['.txt', '.md', '.markdown', '.pdf', '.docx']):
+                    return jsonify({"error": "Only txt/md/pdf/docx/zip supported for now"}), 400
+                texts.extend(_extract_text_from_file(filepath))
+
+        # Clear existing chunks (if any)
+        db.clear_rag_chunks(source_id)
+        for fname, text in texts:
+            for chunk in _chunk_text_for_rag(text):
+                embedding = None
+                try:
+                    embedding = _get_embedding(chunk)
+                except Exception as e:
+                    logger.warning(f"Embedding failed, using hash: {e}")
+                    embedding = _hash_embed(chunk)
+                db.add_rag_chunk(source_id, profile_id, chunk, meta={"file": fname}, embedding=embedding)
+
+        db.upsert_rag_source(source_id, profile_id, name, "upload", status="ready", meta={"files": len(texts)})
+        return jsonify({"success": True, "id": source_id})
+    except Exception as e:
+        logger.error(f"Failed to ingest RAG source: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/rag/sources/<source_id>", methods=["DELETE"])
+def rag_source_delete(source_id):
+    try:
+        db.delete_rag_source(source_id)
+        return jsonify({"success": True})
+    except Exception as e:
+        logger.error(f"Failed to delete source: {e}")
+        return jsonify({"error": str(e)}), 500
+
 # Profile API
 
 @app.route("/api/profiles", methods=["GET"])
@@ -942,6 +1614,29 @@ def delete_profile(profile_id):
         logger.error(f"Failed to delete profile: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/profiles/<profile_id>/export", methods=["GET"])
+def export_profile(profile_id):
+    """Export all data for a profile"""
+    try:
+        payload = db.export_profile_data(profile_id)
+        return jsonify(payload)
+    except Exception as e:
+        logger.error(f"Failed to export profile: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/profiles/<profile_id>/import", methods=["POST"])
+def import_profile(profile_id):
+    """Import profile data payload"""
+    try:
+        data = request.json or {}
+        success = db.import_profile_data(profile_id, data)
+        if not success:
+            return jsonify({"error": "Import failed"}), 400
+        return jsonify({"success": True})
+    except Exception as e:
+        logger.error(f"Failed to import profile: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/profiles/<profile_id>/settings", methods=["GET"])
 def get_profile_settings(profile_id):
     """Get settings for a profile"""
@@ -961,6 +1656,113 @@ def update_profile_settings(profile_id):
         return jsonify({"success": success})
     except Exception as e:
         logger.error(f"Failed to update profile settings: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# Conversation API
+
+@app.route("/api/conversations", methods=["GET"])
+def get_conversations():
+    """Get all conversations for a profile"""
+    try:
+        profile_id = request.headers.get("X-Profile-ID", "default")
+        folder_id = request.args.get("folder_id")
+        conversations = db.get_conversations(profile_id, folder_id=folder_id)
+        return jsonify({"conversations": conversations})
+    except Exception as e:
+        logger.error(f"Failed to get conversations: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/conversations", methods=["POST"])
+def create_conversation():
+    """Create a new conversation"""
+    try:
+        from datetime import datetime
+        profile_id = request.headers.get("X-Profile-ID", "default")
+        data = request.json or {}
+        
+        # Use provided ID from frontend
+        conversation_id = data.get("id", str(int(datetime.now().timestamp() * 1000)))
+        title = data.get("title", "New Chat")
+        folder_id = data.get("folder_id")
+        
+        # Create conversation in database with the provided ID
+        db.create_conversation(conversation_id, title, profile_id, folder_id)
+        logger.info(f"Created conversation {conversation_id} for profile {profile_id}")
+        return jsonify({"id": conversation_id, "title": title, "folder_id": folder_id}), 201
+    except Exception as e:
+        logger.error(f"Failed to create conversation: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/conversations/<conversation_id>", methods=["GET", "DELETE"])
+def conversation_by_id(conversation_id):
+    """Get or delete a specific conversation"""
+    if request.method == "GET":
+        try:
+            conversation = db.get_conversation(conversation_id)
+            if not conversation:
+                return jsonify({"error": "Conversation not found"}), 404
+            return jsonify({"conversation": conversation})
+        except Exception as e:
+            logger.error(f"Failed to get conversation: {e}")
+            return jsonify({"error": str(e)}), 500
+    else:  # DELETE
+        try:
+            success = db.delete_conversation(conversation_id)
+            if not success:
+                return jsonify({"error": "Conversation not found"}), 404
+            return jsonify({"success": True})
+        except Exception as e:
+            logger.error(f"Failed to delete conversation: {e}")
+            return jsonify({"error": str(e)}), 500
+
+@app.route("/api/conversations/<conversation_id>/messages", methods=["POST"])
+def add_message(conversation_id):
+    """Add a message to a conversation"""
+    try:
+        profile_id = request.headers.get("X-Profile-ID", "default")
+        data = request.json
+        
+        message_id = data.get("id", str(int(datetime.now().timestamp() * 1000)))
+        role = data.get("role")
+        content = data.get("content")
+        model = data.get("model")
+        
+        if not all([role, content]):
+            return jsonify({"error": "Missing required fields"}), 400
+        
+        message = db.add_message(message_id, conversation_id, role, content, model)
+        return jsonify({"success": True, "message": message}), 201
+    except Exception as e:
+        logger.error(f"Failed to add message: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/conversations/import", methods=["POST"])
+def import_conversation():
+    """Import a conversation from JSON payload"""
+    try:
+        profile_id = request.headers.get("X-Profile-ID", "default")
+        payload = request.json or {}
+        convo = payload.get("conversation") or payload
+        if not isinstance(convo, dict):
+            return jsonify({"error": "conversation payload required"}), 400
+
+        conversation_id = convo.get("id") or str(int(datetime.now().timestamp() * 1000))
+        title = convo.get("title") or "Imported Chat"
+        folder_id = convo.get("folder_id")
+        db.create_conversation(conversation_id, title, profile_id, folder_id)
+
+        for msg in convo.get("messages", []):
+            db.add_message(
+                msg.get("id", str(int(datetime.now().timestamp() * 1000))),
+                conversation_id,
+                msg.get("role", "assistant"),
+                msg.get("content", ""),
+                msg.get("model")
+            )
+
+        return jsonify({"success": True, "id": conversation_id})
+    except Exception as e:
+        logger.error(f"Failed to import conversation: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":

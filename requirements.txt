@@ -1,3 +1,6 @@
 sounddevice
 numpy
 onnxruntime
+PyPDF2
+python-docx
+openai

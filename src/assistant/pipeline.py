@@ -17,7 +17,7 @@ class AssistantPipeline:
             logger.error(f"Failed to initialize TTS: {e}")
             self.tts = None
 
-    def generate_response(self, user_input: str, model_preference: str = "chat", voice_style: str = None, voice_speed: float = 1.0, provider: str = "ollama", api_key: str = None, system_prompt: str = None) -> dict:
+    def generate_response(self, user_input: str, model_preference: str = "chat", voice_style: str = None, voice_speed: float = 1.0, provider: str = "ollama", api_key: str = None, system_prompt: str = None, temperature: float = 0.7) -> dict:
         """
         Generates response and audio (if available).
         Returns:
@@ -34,7 +34,8 @@ class AssistantPipeline:
             model_preference, 
             provider=provider, 
             api_key=api_key,
-            system_prompt=system_prompt
+            system_prompt=system_prompt,
+            temperature=temperature
         )
         
         result = {

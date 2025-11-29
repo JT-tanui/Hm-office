@@ -11,7 +11,7 @@ class OpenRouterClient:
         self.api_key = api_key
         self.base_url = "https://openrouter.ai/api/v1"
     
-    def generate(self, prompt: str, model: str = "minimax/minimax-01", system: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    def generate(self, prompt: str, model: str = "minimax/minimax-01", system: Optional[str] = None, options: Optional[Dict[str, Any]] = None, temperature: float = 0.7) -> Optional[str]:
         """
         Generates a response from OpenRouter API.
         
@@ -19,7 +19,8 @@ class OpenRouterClient:
             prompt: User prompt
             model: Model ID (e.g., "minimax/minimax-01")
             system: Optional system message
-            options: Optional parameters (temperature, max_tokens, etc.)
+            options: Optional parameters (max_tokens, etc.)
+            temperature: decoding temperature
         
         Returns:
             Response text or None on error
@@ -40,7 +41,7 @@ class OpenRouterClient:
             "messages": messages
         }
         
-        # Add optional parameters
+        payload["temperature"] = max(0.0, min(temperature, 2.0))
         if options:
             payload.update(options)
         
@@ -78,7 +79,7 @@ class OpenRouterClient:
             logger.error(f"Error generating response from OpenRouter: {e}")
             return None
     
-    def stream_generate(self, prompt: str, model: str = "minimax/minimax-01", system: Optional[str] = None):
+    def stream_generate(self, prompt: str, model: str = "minimax/minimax-01", system: Optional[str] = None, temperature: float = 0.7, options: Optional[Dict[str, Any]] = None):
         """
         Stream responses from OpenRouter.
         Yields text chunks as they arrive.
@@ -97,8 +98,11 @@ class OpenRouterClient:
         payload = {
             "model": model,
             "messages": messages,
-            "stream": True
+            "stream": True,
+            "temperature": max(0.0, min(temperature, 2.0))
         }
+        if options:
+            payload.update(options)
         
         data = json.dumps(payload).encode("utf-8")
         headers = {

@@ -33,6 +33,7 @@ OPENROUTER_MODELS = {
 }
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # TTS Configuration
 TTS_MODEL_PATH = ASSETS_DIR / "model.onnx" # Verify exact name in assets
