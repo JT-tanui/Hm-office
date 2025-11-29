@@ -205,6 +205,18 @@ class ConversationDB:
             )
         ''')
 
+        # Users table (email/passwordless)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                login_code TEXT,
+                code_expires INTEGER,
+                session_token TEXT,
+                created_at INTEGER NOT NULL
+            )
+        ''')
+
         # RAG sources
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS rag_sources (
@@ -617,6 +629,44 @@ class ConversationDB:
         conn.commit()
         conn.close()
         return updated
+
+    # ================= AUTH =================
+    def request_login_code(self, email: str, code: str, expires_at: int):
+        conn = self._connect()
+        cursor = conn.cursor()
+        user_id = str(int(datetime.now().timestamp() * 1000))
+        cursor.execute('INSERT OR IGNORE INTO users (id, email, created_at) VALUES (?, ?, ?)', (user_id, email, int(datetime.now().timestamp())))
+        cursor.execute('UPDATE users SET login_code = ?, code_expires = ? WHERE email = ?', (code, expires_at, email))
+        conn.commit()
+        conn.close()
+
+    def verify_login_code(self, email: str, code: str) -> Optional[str]:
+        conn = self._connect()
+        cursor = conn.cursor()
+        now = int(datetime.now().timestamp())
+        cursor.execute('SELECT id, login_code, code_expires FROM users WHERE email = ?', (email,))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return None
+        user_id, stored_code, expires = row
+        if stored_code != code or (expires and expires < now):
+            conn.close()
+            return None
+        session = str(int(datetime.now().timestamp() * 1000))
+        cursor.execute('UPDATE users SET session_token = ?, login_code = NULL, code_expires = NULL WHERE id = ?', (session, user_id))
+        conn.commit()
+        conn.close()
+        return session
+
+    def get_user_by_session(self, session_token: str) -> Optional[Dict]:
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM users WHERE session_token = ?', (session_token,))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
 
     # ================= RAG SOURCES =================
 

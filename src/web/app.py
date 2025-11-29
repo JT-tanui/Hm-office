@@ -13,6 +13,7 @@ from werkzeug.utils import secure_filename
 import tempfile
 import zipfile
 import requests
+import random
 
 # Add src to path so we can import assistant modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -50,6 +51,13 @@ app.config['WAKE_SOUND_FOLDER'] = WAKE_SOUND_FOLDER
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def get_session_profile():
+    token = request.cookies.get("session_token")
+    if not token:
+        return None
+    user = db.get_user_by_session(token)
+    return user
 
 def _extract_text_from_file(path: str) -> list:
     """Return list of (name, text) from a file path (txt/md/pdf/docx)."""
@@ -344,6 +352,7 @@ def chat_stream():
     from flask import Response, stream_with_context
     
     data = request.json
+    session_user = get_session_profile()
     user_input = data.get("text")
     model_preference = data.get("model", "chat")
     voice_style = data.get("voice")
@@ -632,6 +641,7 @@ def get_config():
 def get_settings_api():
     """Get user settings"""
     try:
+        session_user = get_session_profile()
         profile_id = request.headers.get("X-Profile-ID", "default")
         settings = db.get_settings()
         profile_settings = db.get_profile_settings(profile_id)
@@ -649,6 +659,7 @@ def get_settings_api():
 def update_settings_api():
     """Update user settings"""
     try:
+        session_user = get_session_profile()
         data = request.json or {}
         profile_id = request.headers.get("X-Profile-ID", "default")
         success_global = db.update_settings(data)
@@ -997,6 +1008,9 @@ def search_messages_api():
 def list_integrations():
     """List available integrations and connection state for the current profile"""
     try:
+        session_user = get_session_profile()
+        if not session_user:
+            return jsonify({"error": "auth required"}), 401
         profile_id = request.headers.get("X-Profile-ID", "default")
         available = integration_manager.get_available_integrations()
         connected = db.get_integrations(profile_id)
@@ -1031,6 +1045,9 @@ def list_integrations():
 def connect_integration():
     """Create or update an integration connection"""
     try:
+        session_user = get_session_profile()
+        if not session_user:
+            return jsonify({"error": "auth required"}), 401
         profile_id = request.headers.get("X-Profile-ID", "default")
         data = request.json or {}
         service = data.get("service")
@@ -1065,6 +1082,9 @@ def connect_integration():
 def delete_integration_api(integration_id):
     """Disconnect an integration"""
     try:
+        session_user = get_session_profile()
+        if not session_user:
+            return jsonify({"error": "auth required"}), 401
         success = db.delete_integration(integration_id)
         if not success:
             return jsonify({"error": "Integration not found"}), 404
@@ -1101,9 +1121,32 @@ def _get_integration_token(profile_id: str, service: str) -> str:
             return item.get("access_token")
     return None
 
+@app.route("/api/integrations/google_drive/folders", methods=["GET"])
+def google_drive_folders():
+    profile_id = request.headers.get("X-Profile-ID", "default")
+    session_user = get_session_profile()
+    if not session_user:
+        return jsonify({"folders": []}), 401
+    token = _get_integration_token(profile_id, "google_drive")
+    if not token:
+        return jsonify({"folders": []})
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        params = {"q": "mimeType='application/vnd.google-apps.folder' and trashed=false", "pageSize": 50, "fields": "files(id,name)"}
+        resp = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params=params, timeout=15)
+        data = resp.json()
+        return jsonify({"folders": data.get("files", [])})
+    except Exception as e:
+        logger.error(f"Drive folders failed: {e}")
+        return jsonify({"folders": []})
+
+
 @app.route("/api/integrations/notion/pages", methods=["GET", "POST"])
 def notion_pages():
     profile_id = request.headers.get("X-Profile-ID", "default")
+    session_user = get_session_profile()
+    if not session_user:
+        return jsonify({"error": "auth required"}), 401
     token = _get_integration_token(profile_id, "notion")
     if not token:
         return jsonify({"error": "Notion not connected"}), 400
@@ -1139,14 +1182,20 @@ def notion_pages():
 def google_drive_upload():
     """Upload a text snippet to Google Drive"""
     profile_id = request.headers.get("X-Profile-ID", "default")
+    session_user = get_session_profile()
+    if not session_user:
+        return jsonify({"error": "auth required"}), 401
     token = _get_integration_token(profile_id, "google_drive")
     if not token:
         return jsonify({"error": "Google Drive not connected"}), 400
     data = request.json or {}
     content = data.get("content", "")
     filename = data.get("filename", "tanui_note.txt")
+    parent_id = data.get("parent_id")
     try:
         metadata = {"name": filename}
+        if parent_id:
+            metadata["parents"] = [parent_id]
         files = {
             'data': ('metadata', json_module.dumps(metadata), 'application/json'),
             'file': ('content', content, 'text/plain')
@@ -1485,6 +1534,9 @@ def search_voice_memos():
 @app.route("/api/rag/sources", methods=["GET", "POST"])
 def rag_sources():
     profile_id = request.headers.get("X-Profile-ID", "default")
+    session_user = get_session_profile()
+    if not session_user:
+        return jsonify({"error": "auth required"}), 401
     if request.method == "GET":
         try:
             sources = db.list_rag_sources(profile_id)
@@ -1764,6 +1816,51 @@ def import_conversation():
     except Exception as e:
         logger.error(f"Failed to import conversation: {e}")
         return jsonify({"error": str(e)}), 500
+
+@app.route("/api/auth/request-code", methods=["POST"])
+def auth_request_code():
+    try:
+        data = request.json or {}
+        email = data.get("email")
+        if not email:
+            return jsonify({"error": "email required"}), 400
+        code = str(random.randint(100000, 999999))
+        expires = int(datetime.now().timestamp()) + 600
+        db.request_login_code(email, code, expires)
+        logger.info(f"Login code for {email}: {code}")
+        return jsonify({"success": True, "code": code})
+    except Exception as e:
+        logger.error(f"Auth code error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/auth/verify", methods=["POST"])
+def auth_verify():
+    try:
+        data = request.json or {}
+        email = data.get("email")
+        code = data.get("code")
+        if not email or not code:
+            return jsonify({"error": "email and code required"}), 400
+        session_token = db.verify_login_code(email, code)
+        if not session_token:
+            return jsonify({"error": "Invalid or expired code"}), 400
+        resp = jsonify({"success": True, "session": session_token})
+        resp.set_cookie("session_token", session_token, httponly=True, samesite='Lax')
+        return resp
+    except Exception as e:
+        logger.error(f"Auth verify error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/auth/me", methods=["GET"])
+def auth_me():
+    token = request.cookies.get("session_token")
+    if not token:
+        return jsonify({"user": None})
+    user = db.get_user_by_session(token)
+    if not user:
+        return jsonify({"user": None})
+    return jsonify({"user": {"id": user["id"], "email": user["email"]}})
+
 
 if __name__ == "__main__":
     print("Starting Web Interface on http://localhost:5000")
