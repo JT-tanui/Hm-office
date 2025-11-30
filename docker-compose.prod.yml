@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  backend:
+    image: ghcr.io/${GITHUB_REPOSITORY}-backend:latest
+    container_name: assistant-backend
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - FLASK_ENV=production
+    volumes:
+      - conversations-data:/app/conversations.db
+      - audio-data:/app/src/web/static/audio
+    networks:
+      - tanui-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  frontend:
+    image: ghcr.io/${GITHUB_REPOSITORY}-frontend:latest
+    container_name: assistant-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://138.68.59.201:5000
+    depends_on:
+      - backend
+    networks:
+      - tanui-network
+
+networks:
+  tanui-network:
+    driver: bridge
+
+volumes:
+  conversations-data:
+  audio-data:
