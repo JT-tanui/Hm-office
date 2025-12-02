@@ -1,20 +1,39 @@
 import logging
 import os
-from .llm import LLMService
-from .tts_supertonic import SupertonicTTS
-from utils.audio_io import play_audio
 
 logger = logging.getLogger(__name__)
+
+# Lazy import for TTS to allow running without onnxruntime
+def get_tts_class():
+    try:
+        from .tts_supertonic import SupertonicTTS
+        return SupertonicTTS
+    except ImportError as e:
+        logger.warning(f"TTS not available: {e}")
+        return None
+
+# Lazy import for LLM
+def get_llm_service():
+    from .llm import LLMService
+    return LLMService
 
 class AssistantPipeline:
     def __init__(self):
         logger.info("Initializing Assistant Pipeline...")
+        LLMService = get_llm_service()
         self.llm = LLMService()
-        try:
-            self.tts = SupertonicTTS()
-            logger.info("TTS initialized successfully.")
-        except Exception as e:
-            logger.error(f"Failed to initialize TTS: {e}")
+        
+        # Try to initialize TTS, but don't fail if unavailable
+        SupertonicTTS = get_tts_class()
+        if SupertonicTTS:
+            try:
+                self.tts = SupertonicTTS()
+                logger.info("TTS initialized successfully.")
+            except Exception as e:
+                logger.error(f"Failed to initialize TTS: {e}")
+                self.tts = None
+        else:
+            logger.info("TTS module not available (missing onnxruntime)")
             self.tts = None
 
     def generate_response(self, user_input: str, model_preference: str = "chat", voice_style: str = None, voice_speed: float = 1.0, provider: str = "ollama", api_key: str = None, system_prompt: str = None, temperature: float = 0.7) -> dict:
@@ -244,6 +263,7 @@ class AssistantPipeline:
 
         if result["audio"] is not None:
             try:
+                from utils.audio_io import play_audio
                 play_audio(result["audio"], result["sample_rate"])
             except Exception as e:
                 logger.error(f"Playback error: {e}")
