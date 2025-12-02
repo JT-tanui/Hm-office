@@ -6,16 +6,18 @@
 |----------|-------|
 | IP Address | 138.68.59.201 |
 | Domain | leonelgroup.co.ke |
-| Subdomain | assistant.leonelgroup.co.ke |
+| Subdomain | **assistant.leonelgroup.co.ke** |
 | OS | Ubuntu 24.04 |
 | SSH | `ssh root@138.68.59.201` |
 
-## Services Deployed
+## 🟢 Current Status
 
-| Service | Port | Container | Description |
-|---------|------|-----------|-------------|
-| Backend (Flask API) | 3001 | assistant-backend | Python Flask API with Ollama integration |
-| Frontend (Next.js) | 3002 | assistant-frontend | Next.js web interface |
+| Service | Port | Container | Status |
+|---------|------|-----------|--------|
+| Backend (Flask API) | 3001 | assistant-backend | ✅ Running |
+| Nginx Reverse Proxy | 443 | - | ✅ Configured |
+
+**Access URL**: https://assistant.leonelgroup.co.ke (after DNS is configured)
 
 ## Architecture
 

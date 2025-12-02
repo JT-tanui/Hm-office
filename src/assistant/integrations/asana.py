@@ -15,7 +15,7 @@ class AsanaIntegration(Integration):
         return f"https://app.asana.com/-/oauth_authorize?client_id={{ASANA_CLIENT_ID}}&redirect_uri={redirect_uri}&response_type=code&scope={scope}"
 
     def handle_callback(self, code: str, redirect_uri: str) -> Dict[str, Any]:
-        return {"access_token": "asana_token_placeholder", "refresh_token": "asana_refresh_placeholder", "expires_at": 0}
+        return {"access_token": code, "refresh_token": None, "expires_at": 0}
 
     def disconnect(self) -> bool:
         return True

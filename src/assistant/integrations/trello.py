@@ -14,7 +14,7 @@ class TrelloIntegration(Integration):
         return f"https://trello.com/1/authorize?response_type=token&key={{TRELLO_KEY}}&return_url={redirect_uri}&scope=read,write"
 
     def handle_callback(self, code: str, redirect_uri: str) -> Dict[str, Any]:
-        return {"access_token": "trello_token_placeholder", "refresh_token": None, "expires_at": 0}
+        return {"access_token": code, "refresh_token": None, "expires_at": 0}
 
     def disconnect(self) -> bool:
         return True
