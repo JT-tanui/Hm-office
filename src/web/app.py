@@ -14,6 +14,7 @@ import tempfile
 import zipfile
 import requests
 import random
+from typing import Dict, Any, Optional
 
 # Add src to path so we can import assistant modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -655,6 +656,89 @@ def get_settings_api():
         logger.error(f"Failed to get settings: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/integrations/trello/cards", methods=["POST"])
+def trello_cards():
+    profile_id = request.headers.get("X-Profile-ID", "default")
+    token = _ensure_token("trello", profile_id)
+    if not token:
+        return jsonify({"error": "Trello not connected"}), 400
+    key = os.getenv("TRELLO_KEY")
+    if not key:
+        return jsonify({"error": "TRELLO_KEY not set"}), 500
+    data = request.json or {}
+    list_id = data.get("list_id")
+    name = data.get("name", "From Tanui")
+    desc = data.get("desc", "")
+    if not list_id:
+        return jsonify({"error": "list_id required"}), 400
+    resp = requests.post(
+        "https://api.trello.com/1/cards",
+        params={"idList": list_id, "name": name, "desc": desc, "key": key, "token": token},
+        timeout=15
+    )
+    return jsonify(resp.json()), resp.status_code
+
+@app.route("/api/integrations/asana/tasks", methods=["POST"])
+def asana_tasks():
+    profile_id = request.headers.get("X-Profile-ID", "default")
+    token = _ensure_token("asana", profile_id)
+    if not token:
+        return jsonify({"error": "Asana not connected"}), 400
+    data = request.json or {}
+    project_id = data.get("project_id")
+    name = data.get("name", "From Tanui")
+    notes = data.get("notes", "")
+    if not project_id:
+        return jsonify({"error": "project_id required"}), 400
+    resp = requests.post(
+        "https://app.asana.com/api/1.0/tasks",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"data": {"projects": [project_id], "name": name, "notes": notes}},
+        timeout=15
+    )
+    return jsonify(resp.json()), resp.status_code
+
+@app.route("/api/integrations/google_keep/notes", methods=["POST"])
+def google_keep_notes():
+    profile_id = request.headers.get("X-Profile-ID", "default")
+    token = _ensure_token("google_keep", profile_id)
+    if not token:
+        return jsonify({"error": "Google Keep not connected"}), 400
+    data = request.json or {}
+    title = data.get("title", "From Tanui")
+    text = data.get("text", "")
+    resp = requests.post(
+        "https://keep.googleapis.com/v1/notes",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"title": title, "textContent": {"text": text}},
+        timeout=15
+    )
+    return jsonify(resp.json()), resp.status_code
+
+@app.route("/api/integrations/ms/tasks", methods=["POST"])
+def ms_tasks():
+    profile_id = request.headers.get("X-Profile-ID", "default")
+    token = _ensure_token("microsoft_graph", profile_id)
+    if not token:
+        return jsonify({"error": "Microsoft Graph not connected"}), 400
+    data = request.json or {}
+    list_id = data.get("list_id")
+    title = data.get("title", "From Tanui")
+    if not list_id:
+        lists_resp = requests.get("https://graph.microsoft.com/v1.0/me/todo/lists", headers={"Authorization": f"Bearer {token}"}, timeout=15)
+        lists = lists_resp.json().get("value", [])
+        if lists:
+            list_id = lists[0].get("id")
+        else:
+            return jsonify({"error": "No todo list found"}), 400
+    resp = requests.post(
+        f"https://graph.microsoft.com/v1.0/me/todo/lists/{list_id}/tasks",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"title": title},
+        timeout=15
+    )
+    return jsonify(resp.json()), resp.status_code
+
 @app.route("/api/settings", methods=["POST"])
 def update_settings_api():
     """Update user settings"""
@@ -1121,13 +1205,81 @@ def _get_integration_token(profile_id: str, service: str) -> str:
             return item.get("access_token")
     return None
 
+def _get_integration_record(profile_id: str, service: str):
+    integrations = db.get_integrations(profile_id)
+    for item in integrations:
+        if item.get("service") == service:
+            return item
+    return None
+
+def _refresh_google_token(refresh_token: str) -> Optional[Dict[str, Any]]:
+    client_id = os.getenv("GOOGLE_CLIENT_ID")
+    client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+    if not client_id or not client_secret or not refresh_token:
+        return None
+    resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token"
+        },
+        timeout=10
+    )
+    if resp.status_code != 200:
+        logger.warning(f"Google refresh failed: {resp.text}")
+        return None
+    return resp.json()
+
+def _refresh_notion_token(refresh_token: str) -> Optional[Dict[str, Any]]:
+    client_id = os.getenv("NOTION_CLIENT_ID")
+    client_secret = os.getenv("NOTION_CLIENT_SECRET")
+    if not client_id or not client_secret or not refresh_token:
+        return None
+    resp = requests.post(
+        "https://api.notion.com/v1/oauth/token",
+        auth=(client_id, client_secret),
+        json={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token
+        },
+        timeout=10
+    )
+    if resp.status_code != 200:
+        logger.warning(f"Notion refresh failed: {resp.text}")
+        return None
+    return resp.json()
+
+def _ensure_token(service: str, profile_id: str) -> Optional[str]:
+    rec = _get_integration_record(profile_id, service)
+    if not rec:
+        return None
+    token = rec.get("access_token")
+    if token:
+        return token
+    refresh = rec.get("refresh_token")
+    if not refresh:
+        return None
+    if service in ("google_drive", "google_keep"):
+        data = _refresh_google_token(refresh)
+        if data and data.get("access_token"):
+            db.create_integration(profile_id, service, data.get("access_token"), refresh_token=data.get("refresh_token") or refresh, expires_at=data.get("expires_in"))
+            return data.get("access_token")
+    if service == "notion":
+        data = _refresh_notion_token(refresh)
+        if data and data.get("access_token"):
+            db.create_integration(profile_id, service, data.get("access_token"), refresh_token=data.get("refresh_token") or refresh, expires_at=data.get("expires_in"))
+            return data.get("access_token")
+    return token
+
 @app.route("/api/integrations/google_drive/folders", methods=["GET"])
 def google_drive_folders():
     profile_id = request.headers.get("X-Profile-ID", "default")
     session_user = get_session_profile()
     if not session_user:
         return jsonify({"folders": []}), 401
-    token = _get_integration_token(profile_id, "google_drive")
+    token = _ensure_token("google_drive", profile_id)
     if not token:
         return jsonify({"folders": []})
     try:
@@ -1147,7 +1299,7 @@ def notion_pages():
     session_user = get_session_profile()
     if not session_user:
         return jsonify({"error": "auth required"}), 401
-    token = _get_integration_token(profile_id, "notion")
+    token = _ensure_token("notion", profile_id)
     if not token:
         return jsonify({"error": "Notion not connected"}), 400
     headers = {
@@ -1185,7 +1337,7 @@ def google_drive_upload():
     session_user = get_session_profile()
     if not session_user:
         return jsonify({"error": "auth required"}), 401
-    token = _get_integration_token(profile_id, "google_drive")
+    token = _ensure_token("google_drive", profile_id)
     if not token:
         return jsonify({"error": "Google Drive not connected"}), 400
     data = request.json or {}
@@ -1716,6 +1868,8 @@ def update_profile_settings(profile_id):
 def get_conversations():
     """Get all conversations for a profile"""
     try:
+        if not get_session_profile():
+            return jsonify({"error": "auth required"}), 401
         profile_id = request.headers.get("X-Profile-ID", "default")
         folder_id = request.args.get("folder_id")
         conversations = db.get_conversations(profile_id, folder_id=folder_id)
@@ -1728,6 +1882,8 @@ def get_conversations():
 def create_conversation():
     """Create a new conversation"""
     try:
+        if not get_session_profile():
+            return jsonify({"error": "auth required"}), 401
         from datetime import datetime
         profile_id = request.headers.get("X-Profile-ID", "default")
         data = request.json or {}
@@ -1750,6 +1906,8 @@ def conversation_by_id(conversation_id):
     """Get or delete a specific conversation"""
     if request.method == "GET":
         try:
+            if not get_session_profile():
+                return jsonify({"error": "auth required"}), 401
             conversation = db.get_conversation(conversation_id)
             if not conversation:
                 return jsonify({"error": "Conversation not found"}), 404
@@ -1759,6 +1917,8 @@ def conversation_by_id(conversation_id):
             return jsonify({"error": str(e)}), 500
     else:  # DELETE
         try:
+            if not get_session_profile():
+                return jsonify({"error": "auth required"}), 401
             success = db.delete_conversation(conversation_id)
             if not success:
                 return jsonify({"error": "Conversation not found"}), 404
@@ -1771,6 +1931,8 @@ def conversation_by_id(conversation_id):
 def add_message(conversation_id):
     """Add a message to a conversation"""
     try:
+        if not get_session_profile():
+            return jsonify({"error": "auth required"}), 401
         profile_id = request.headers.get("X-Profile-ID", "default")
         data = request.json
         
@@ -1860,6 +2022,25 @@ def auth_me():
     if not user:
         return jsonify({"user": None})
     return jsonify({"user": {"id": user["id"], "email": user["email"]}})
+
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    """Health check endpoint for Docker/load balancer"""
+    try:
+        # Check database connectivity
+        db.get_settings()
+        return jsonify({
+            "status": "healthy",
+            "service": "assistant-backend",
+            "timestamp": datetime.now().isoformat()
+        }), 200
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return jsonify({
+            "status": "unhealthy",
+            "error": str(e)
+        }), 503
 
 
 if __name__ == "__main__":
