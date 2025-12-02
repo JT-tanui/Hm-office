@@ -221,9 +221,11 @@ integration_manager.register(MicrosoftGraphIntegration)
 integration_manager.register(TrelloIntegration)
 integration_manager.register(AsanaIntegration)
 
-@app.route("/")
-def index():
-    return app.send_static_file("index.html")
+# Frontend is served separately via Next.js
+# This route is disabled as we use a separate frontend container
+# @app.route("/")
+# def index():
+#     return app.send_static_file("index.html")
 
 @app.route("/api/chat", methods=["POST"])
 def chat():

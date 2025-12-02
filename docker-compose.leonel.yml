@@ -1,0 +1,54 @@
+version: '3.8'
+
+# Complete Docker Compose for Leonel Group Assistant
+# Backend, Frontend, and Ollama integration
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.light
+    container_name: assistant-backend
+    restart: unless-stopped
+    ports:
+      - "3001:5000"
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - FLASK_ENV=production
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data
+      - ./src/web/static:/app/src/web/static
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    deploy:
+      resources:
+        limits:
+          memory: 200M
+        reservations:
+          memory: 100M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  frontend:
+    image: node:20-alpine
+    container_name: assistant-frontend
+    restart: unless-stopped
+    ports:
+      - "3002:3000"
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_API_URL=https://assistant.leonelgroup.co.ke/api
+    working_dir: /app
+    volumes:
+      - ./src/web/client:/app
+    command: npm start
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
