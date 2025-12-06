@@ -58,4 +58,14 @@ docker-compose.override.yml
 # Snyk Security Extension - AI Rules (auto-generated)
 .github/instructions/snyk_rules.instructions.md
 
+# Generated Audio files
+*.wav
+*.mp3
+src/web/static/audio/
+supertonic/nodejs/results/
+
+# Supertonic assets (submodule - large ONNX models)
+supertonic/assets/
+
+# Archives folder
 Archives/
