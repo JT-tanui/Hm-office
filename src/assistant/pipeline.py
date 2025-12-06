@@ -119,8 +119,11 @@ class AssistantPipeline:
                     
                     # Concatenate chunks with small silence
                     import numpy as np
-                    # Create 1D silence array to match TTS output shape
-                    silence = np.zeros(int(0.3 * sample_rate), dtype=np.float32)
+                    if result["sample_rate"]:
+                        silence = np.zeros(int(0.3 * result["sample_rate"]), dtype=np.float32)
+                    else:
+                        silence = np.zeros(1, dtype=np.float32)
+
                     audio_parts = []
                     for i, chunk in enumerate(audio_chunks):
                         audio_parts.append(chunk)
@@ -132,9 +135,16 @@ class AssistantPipeline:
                     result["audio"] = np.concatenate(audio_parts, axis=0)
                     logger.info("Audio concatenation successful")
                 else:
-                    audio, sample_rate = self.tts.synthesize(clean_text, style_path=style_path, speed=speed)
-                    result["audio"] = audio
-                    result["sample_rate"] = sample_rate
+                    try:
+                        audio, sample_rate = self.tts.synthesize(clean_text, style_path=style_path, speed=speed)
+                        result["audio"] = audio
+                        result["sample_rate"] = sample_rate
+                    except Exception:
+                        # Fallback to default style at normal speed if custom style fails
+                        logger.warning("Custom style synthesis failed, retrying with default style.")
+                        audio, sample_rate = self.tts.synthesize(clean_text, style_path=None, speed=1.0)
+                        result["audio"] = audio
+                        result["sample_rate"] = sample_rate
             except Exception as e:
                 logger.error(f"TTS error: {e}")
         
@@ -163,7 +173,10 @@ class AssistantPipeline:
         # Remove code blocks
         text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
         text = re.sub(r'`(.+?)`', r'\1', text)
-        
+
+        # Normalize ellipses
+        text = re.sub(r'\.\s*\.\s*\.', '.', text)
+
         # Expand common abbreviations
         text = re.sub(r'\bDr\.', 'Doctor', text)
         text = re.sub(r'\bMr\.', 'Mister', text)
@@ -182,11 +195,30 @@ class AssistantPipeline:
         
         # Remove URLs
         text = re.sub(r'http[s]?://\S+', 'link', text)
+
+        # Treat newlines as sentence breaks to keep prosody natural
+        text = re.sub(r'\s*\n+\s*', '. ', text)
+
+        # Make slashes pronounceable
+        text = text.replace('/', ' slash ')
+
+        # Expand simple version numbers (e.g., 1.2 -> "1 point 2")
+        text = re.sub(r'\b(\d+)\.(\d+)\b', r'\1 point \2', text)
+
+        # Space out long digit runs so they are enunciated (2024 -> 2 0 2 4)
+        def _space_digits(match):
+            num = match.group(1)
+            return " ".join(num)
+        text = re.sub(r'\b(\d{3,})\b', _space_digits, text)
         
         # Remove emojis and special symbols (keep only word chars and basic punctuation)
         # This is the most reliable way to ensure TTS doesn't choke
         text = re.sub(r'[^\w\s.,!?;:\'"()-]', '', text)
-        
+
+        # Remove stray opening/closing quotes/brackets without pairs
+        text = re.sub(r'^[\"\'\)\]\}]', '', text)
+        text = re.sub(r'[\"\'\(\[\{]$', '', text)
+
         # Remove excessive punctuation
         text = re.sub(r'\.{2,}', '.', text)
         text = re.sub(r'!{2,}', '!', text)
@@ -194,6 +226,10 @@ class AssistantPipeline:
         
         # Clean up whitespace
         text = re.sub(r'\s+', ' ', text).strip()
+
+        # Ensure we end with terminal punctuation for smoother cadence
+        if text and text[-1] not in ".!?":
+            text += "."
         
         return text
     
@@ -203,10 +239,10 @@ class AssistantPipeline:
         
         # Split into sentences (multiple delimiters)
         sentences = re.split(r'(?<=[.!?;:])\s+', text)
-        
+
         chunks = []
         current_chunk = ""
-        
+
         for sentence in sentences:
             sentence = sentence.strip()
             if not sentence:
@@ -245,10 +281,13 @@ class AssistantPipeline:
                     if current_chunk:
                         chunks.append(current_chunk)
                     current_chunk = sentence
-        
+
         if current_chunk:
+            # Ensure each chunk ends with terminal punctuation for smoother cadence
+            if current_chunk[-1] not in ".!?":
+                current_chunk += "."
             chunks.append(current_chunk)
-        
+
         return chunks if chunks else [text[:max_length]]
 
     def process_input(self, user_input: str, model_preference: str = "chat"):

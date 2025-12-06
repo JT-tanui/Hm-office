@@ -15,6 +15,7 @@ import zipfile
 import requests
 import random
 from typing import Dict, Any, Optional
+from functools import wraps
 
 # Add src to path so we can import assistant modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -53,12 +54,62 @@ app.config['WAKE_SOUND_FOLDER'] = WAKE_SOUND_FOLDER
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+def require_auth(func):
+    """Decorator to enforce login in production-like mode; skips when debug is on."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if app.debug or os.getenv("FLASK_DEBUG") == "1":
+            return func(*args, **kwargs)
+        user = get_session_profile()
+        if not user:
+            return jsonify({"error": "auth required"}), 401
+        return func(*args, **kwargs)
+    return wrapper
+
+@app.before_request
+def _enforce_auth_for_api():
+    """Require auth for API routes in non-debug mode, except auth/health/static callbacks."""
+    if app.debug or os.getenv("FLASK_DEBUG") == "1":
+        return
+    path = request.path or ""
+    if path == "/health":
+        return
+    if path.startswith("/static"):
+        return
+    if path.startswith("/api/auth"):
+        return
+    if path.startswith("/api/integrations/callback"):
+        return
+    if path.startswith("/api"):
+        if not get_session_profile():
+            return jsonify({"error": "auth required"}), 401
+
 def get_session_profile():
     token = request.cookies.get("session_token")
+    # In debug, allow a lightweight mock user so local dev doesn't require auth
+    if (app.debug or os.getenv("FLASK_DEBUG") == "1") and not token:
+        return {"id": "debug-user", "email": "debug@example.com"}
     if not token:
         return None
     user = db.get_user_by_session(token)
     return user
+
+def resolve_profile_id(requested_id: Optional[str]) -> str:
+    """Return a profile_id that belongs to the current user (or fallback)."""
+    user = get_session_profile()
+    if user:
+        user_id = user.get("id")
+        if requested_id and db.profile_belongs_to_user(requested_id, user_id):
+            return requested_id
+        return db.ensure_user_default_profile(user_id, user.get("email", "user"))
+    return requested_id or "default"
+
+def ensure_profile_access(profile_id: str):
+    """Return a Flask response if access is forbidden, else None."""
+    user = get_session_profile()
+    if user and not db.profile_belongs_to_user(profile_id, user.get("id")):
+        return jsonify({"error": "forbidden"}), 403
+    return None
 
 def _extract_text_from_file(path: str) -> list:
     """Return list of (name, text) from a file path (txt/md/pdf/docx)."""
@@ -245,7 +296,7 @@ def chat():
     rag_source_id = data.get("rag_source_id")
     rag_source_id = data.get("rag_source_id")
     tone = data.get("tone")
-    profile_id = request.headers.get("X-Profile-ID", "default")
+    profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
 
     if not user_input:
         return jsonify({"error": "No text provided"}), 400
@@ -368,9 +419,10 @@ def chat_stream():
     use_cross_context = data.get("use_cross_context", True)  # Enable cross-context by default
     use_web_search = data.get("use_web_search", False)
     use_rag = data.get("use_rag", False)
+    rag_source_id = data.get("rag_source_id")
     tone = data.get("tone")
     temperature = float(data.get("temperature", 0.7))
-    profile_id = request.headers.get("X-Profile-ID", "default")
+    profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
 
     if not user_input:
         return jsonify({"error": "No text provided"}), 400
@@ -645,7 +697,7 @@ def get_settings_api():
     """Get user settings"""
     try:
         session_user = get_session_profile()
-        profile_id = request.headers.get("X-Profile-ID", "default")
+        profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
         settings = db.get_settings()
         profile_settings = db.get_profile_settings(profile_id)
         merged = {
@@ -660,7 +712,7 @@ def get_settings_api():
 
 @app.route("/api/integrations/trello/cards", methods=["POST"])
 def trello_cards():
-    profile_id = request.headers.get("X-Profile-ID", "default")
+    profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
     token = _ensure_token("trello", profile_id)
     if not token:
         return jsonify({"error": "Trello not connected"}), 400
@@ -682,7 +734,7 @@ def trello_cards():
 
 @app.route("/api/integrations/asana/tasks", methods=["POST"])
 def asana_tasks():
-    profile_id = request.headers.get("X-Profile-ID", "default")
+    profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
     token = _ensure_token("asana", profile_id)
     if not token:
         return jsonify({"error": "Asana not connected"}), 400
@@ -702,7 +754,7 @@ def asana_tasks():
 
 @app.route("/api/integrations/google_keep/notes", methods=["POST"])
 def google_keep_notes():
-    profile_id = request.headers.get("X-Profile-ID", "default")
+    profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
     token = _ensure_token("google_keep", profile_id)
     if not token:
         return jsonify({"error": "Google Keep not connected"}), 400
@@ -719,7 +771,7 @@ def google_keep_notes():
 
 @app.route("/api/integrations/ms/tasks", methods=["POST"])
 def ms_tasks():
-    profile_id = request.headers.get("X-Profile-ID", "default")
+    profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
     token = _ensure_token("microsoft_graph", profile_id)
     if not token:
         return jsonify({"error": "Microsoft Graph not connected"}), 400
@@ -747,7 +799,7 @@ def update_settings_api():
     try:
         session_user = get_session_profile()
         data = request.json or {}
-        profile_id = request.headers.get("X-Profile-ID", "default")
+        profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
         success_global = db.update_settings(data)
         profile_updates = {}
         for key in ["voice_style", "voice_speed", "auto_speak", "wake_word_enabled", "wake_word_sensitivity", "activation_sound_path"]:
@@ -856,9 +908,12 @@ def get_models():
 # Wake Word Management
 @app.route("/api/wake-words", methods=["GET", "POST"])
 def wake_words_api():
-    profile_id = request.headers.get("X-Profile-ID", "default")
+    profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
     try:
         if request.method == "GET":
+            user = get_session_profile()
+            if user and not db.profile_belongs_to_user(profile_id, user.get("id")):
+                return jsonify({"error": "forbidden"}), 403
             wake_words = db.get_wake_words(profile_id)
             return jsonify({"wake_words": wake_words})
 
@@ -866,6 +921,9 @@ def wake_words_api():
         word = data.get("word")
         if not word:
             return jsonify({"error": "word is required"}), 400
+        user = get_session_profile()
+        if user and not db.profile_belongs_to_user(profile_id, user.get("id")):
+            return jsonify({"error": "forbidden"}), 403
         new_word = db.add_wake_word(profile_id, word)
         return jsonify(new_word), 201
     except Exception as e:
@@ -875,6 +933,16 @@ def wake_words_api():
 @app.route("/api/wake-words/<wake_word_id>", methods=["DELETE"])
 def delete_wake_word_api(wake_word_id):
     try:
+        # Ensure wake word belongs to current user's profile
+        user = get_session_profile()
+        if user:
+            owned_profiles = [p["id"] for p in db.get_profiles(user.get("id"))]
+            # crude check: delete only if the wake word is attached to a profile owned by the user
+            wake_words = []
+            for pid in owned_profiles:
+                wake_words.extend([w.get("id") for w in db.get_wake_words(pid)])
+            if wake_word_id not in wake_words:
+                return jsonify({"error": "forbidden"}), 403
         success = db.delete_wake_word(wake_word_id)
         if not success:
             return jsonify({"error": "Wake word not found"}), 404
@@ -887,7 +955,7 @@ def delete_wake_word_api(wake_word_id):
 def upload_activation_sound():
     """Upload a custom wake-word activation sound and store path in profile settings"""
     try:
-        profile_id = request.headers.get("X-Profile-ID", "default")
+        profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
         if 'file' not in request.files:
             return jsonify({"error": "No file provided"}), 400
 
@@ -1078,7 +1146,7 @@ def search_messages_api():
     try:
         query = request.args.get("q", "")
         limit = int(request.args.get("limit", 50))
-        profile_id = request.headers.get("X-Profile-ID", "default")
+        profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
         
         if not query:
             return jsonify({"results": []}), 200
@@ -1097,7 +1165,10 @@ def list_integrations():
         session_user = get_session_profile()
         if not session_user:
             return jsonify({"error": "auth required"}), 401
-        profile_id = request.headers.get("X-Profile-ID", "default")
+        profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
+        forbidden = ensure_profile_access(profile_id)
+        if forbidden:
+            return forbidden
         available = integration_manager.get_available_integrations()
         connected = db.get_integrations(profile_id)
         connected_by_service = {item["service"]: item for item in connected}
@@ -1134,7 +1205,10 @@ def connect_integration():
         session_user = get_session_profile()
         if not session_user:
             return jsonify({"error": "auth required"}), 401
-        profile_id = request.headers.get("X-Profile-ID", "default")
+        profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
+        forbidden = ensure_profile_access(profile_id)
+        if forbidden:
+            return forbidden
         data = request.json or {}
         service = data.get("service")
         config = data.get("config", {})
@@ -1171,6 +1245,12 @@ def delete_integration_api(integration_id):
         session_user = get_session_profile()
         if not session_user:
             return jsonify({"error": "auth required"}), 401
+        # Optional header to scope deletion
+        profile_id = request.headers.get("X-Profile-ID")
+        if profile_id:
+            forbidden = ensure_profile_access(resolve_profile_id(profile_id))
+            if forbidden:
+                return forbidden
         success = db.delete_integration(integration_id)
         if not success:
             return jsonify({"error": "Integration not found"}), 404
@@ -1182,7 +1262,10 @@ def delete_integration_api(integration_id):
 @app.route("/api/integrations/callback/<service>")
 def integration_callback(service):
     """OAuth callback for integrations"""
-    profile_id = request.args.get("state") or request.args.get("profile_id", "default")
+    profile_id = resolve_profile_id(request.args.get("state") or request.args.get("profile_id", "default"))
+    forbidden = ensure_profile_access(profile_id)
+    if forbidden:
+        return forbidden
     code = request.args.get("code")
     redirect_uri = request.base_url
     instance = integration_manager.get_integration_instance(service, profile_id)
@@ -1277,10 +1360,13 @@ def _ensure_token(service: str, profile_id: str) -> Optional[str]:
 
 @app.route("/api/integrations/google_drive/folders", methods=["GET"])
 def google_drive_folders():
-    profile_id = request.headers.get("X-Profile-ID", "default")
+    profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
     session_user = get_session_profile()
     if not session_user:
         return jsonify({"folders": []}), 401
+    forbidden = ensure_profile_access(profile_id)
+    if forbidden:
+        return forbidden
     token = _ensure_token("google_drive", profile_id)
     if not token:
         return jsonify({"folders": []})
@@ -1297,10 +1383,13 @@ def google_drive_folders():
 
 @app.route("/api/integrations/notion/pages", methods=["GET", "POST"])
 def notion_pages():
-    profile_id = request.headers.get("X-Profile-ID", "default")
+    profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
     session_user = get_session_profile()
     if not session_user:
         return jsonify({"error": "auth required"}), 401
+    forbidden = ensure_profile_access(profile_id)
+    if forbidden:
+        return forbidden
     token = _ensure_token("notion", profile_id)
     if not token:
         return jsonify({"error": "Notion not connected"}), 400
@@ -1335,7 +1424,7 @@ def notion_pages():
 @app.route("/api/integrations/google_drive/upload", methods=["POST"])
 def google_drive_upload():
     """Upload a text snippet to Google Drive"""
-    profile_id = request.headers.get("X-Profile-ID", "default")
+    profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
     session_user = get_session_profile()
     if not session_user:
         return jsonify({"error": "auth required"}), 401
@@ -1376,7 +1465,7 @@ def filter_conversations_api():
         end_date = request.args.get("end_date", type=int)
         model = request.args.get("model")
         folder_id = request.args.get("folder_id")
-        profile_id = request.headers.get("X-Profile-ID", "default")
+        profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
         
         results = db.filter_conversations(start_date, end_date, model, profile_id=profile_id, folder_id=folder_id)
         return jsonify({"conversations": results, "count": len(results)})
@@ -1388,7 +1477,7 @@ def filter_conversations_api():
 def context_audit():
     """List conversations used as context for a profile"""
     try:
-        profile_id = request.headers.get("X-Profile-ID", "default")
+        profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
         data = db.get_context_audit(profile_id)
         return jsonify({"conversations": data})
     except Exception as e:
@@ -1445,7 +1534,7 @@ def delete_tag_api(tag_id):
 @app.route("/api/folders", methods=["GET", "POST"])
 def folders_api():
     try:
-        profile_id = request.headers.get("X-Profile-ID", "default")
+        profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
         if request.method == "GET":
             folders = db.get_folders(profile_id)
             return jsonify({"folders": folders})
@@ -1464,7 +1553,7 @@ def folders_api():
 @app.route("/api/folders/<folder_id>", methods=["DELETE"])
 def delete_folder(folder_id):
     try:
-        profile_id = request.headers.get("X-Profile-ID", "default")
+        profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
         success = db.delete_folder(folder_id, profile_id)
         if not success:
             return jsonify({"error": "Folder not found"}), 404
@@ -1569,7 +1658,7 @@ def get_voice_memos():
     try:
         limit = int(request.args.get("limit", 50))
         offset = int(request.args.get("offset", 0))
-        profile_id = request.headers.get('X-Profile-ID', 'default')
+        profile_id = resolve_profile_id(request.headers.get('X-Profile-ID'))
         memos = db.get_voice_memos(profile_id=profile_id, limit=limit, offset=offset)
         return jsonify({"memos": memos})
     except Exception as e:
@@ -1601,7 +1690,7 @@ def create_voice_memo():
             title = request.form.get('title', f"Voice Memo {datetime.now().strftime('%Y-%m-%d %H:%M')}")
             duration = float(request.form.get('duration', 0))
             transcription = request.form.get('transcription', "")
-            profile_id = request.headers.get('X-Profile-ID', 'default')
+            profile_id = resolve_profile_id(request.headers.get('X-Profile-ID'))
             
             # Parse tags if provided
             tags_json = request.form.get('tags', '[]')
@@ -1638,6 +1727,9 @@ def get_voice_memo(memo_id):
         memo = db.get_voice_memo(memo_id)
         if not memo:
             return jsonify({"error": "Memo not found"}), 404
+        user = get_session_profile()
+        if user and not db.profile_belongs_to_user(memo.get("profile_id", "default"), user.get("id")):
+            return jsonify({"error": "forbidden"}), 403
         return jsonify({"memo": memo})
     except Exception as e:
         logger.error(f"Failed to get voice memo: {e}")
@@ -1651,6 +1743,9 @@ def delete_voice_memo(memo_id):
         memo = db.get_voice_memo(memo_id)
         if not memo:
             return jsonify({"error": "Memo not found"}), 404
+        user = get_session_profile()
+        if user and not db.profile_belongs_to_user(memo.get("profile_id", "default"), user.get("id")):
+            return jsonify({"error": "forbidden"}), 403
             
         # Delete from DB
         success = db.delete_voice_memo(memo_id)
@@ -1678,7 +1773,8 @@ def search_voice_memos():
         if not query:
             return jsonify({"results": []})
             
-        results = db.search_voice_memos(query, limit)
+        profile_id = resolve_profile_id(request.headers.get('X-Profile-ID'))
+        results = db.search_voice_memos(query, limit, profile_id=profile_id)
         return jsonify({"results": results})
     except Exception as e:
         logger.error(f"Failed to search voice_memos: {e}")
@@ -1687,7 +1783,7 @@ def search_voice_memos():
 # RAG sources
 @app.route("/api/rag/sources", methods=["GET", "POST"])
 def rag_sources():
-    profile_id = request.headers.get("X-Profile-ID", "default")
+    profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
     session_user = get_session_profile()
     if not session_user:
         return jsonify({"error": "auth required"}), 401
@@ -1757,7 +1853,16 @@ def rag_sources():
 @app.route("/api/rag/sources/<source_id>", methods=["DELETE"])
 def rag_source_delete(source_id):
     try:
-        db.delete_rag_source(source_id)
+        # Only allow deletion if the source belongs to this user's profile
+        session_user = get_session_profile()
+        if session_user:
+            # Find source and verify ownership
+            profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
+            sources = db.list_rag_sources(profile_id)
+            if not any(s.get("id") == source_id for s in sources):
+                return jsonify({"error": "forbidden"}), 403
+        profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
+        db.delete_rag_source(source_id, profile_id=profile_id)
         return jsonify({"success": True})
     except Exception as e:
         logger.error(f"Failed to delete source: {e}")
@@ -1769,7 +1874,8 @@ def rag_source_delete(source_id):
 def get_profiles():
     """Get all profiles"""
     try:
-        profiles = db.get_profiles()
+        user = get_session_profile()
+        profiles = db.get_profiles(user.get("id") if user else None)
         return jsonify({"profiles": profiles})
     except Exception as e:
         logger.error(f"Failed to get profiles: {e}")
@@ -1779,13 +1885,14 @@ def get_profiles():
 def create_profile():
     """Create a new profile"""
     try:
+        user = get_session_profile()
         data = request.json
         name = data.get("name")
         if not name:
             return jsonify({"error": "Name is required"}), 400
             
         avatar_path = data.get("avatar_path", "")
-        profile_id = db.create_profile(name, avatar_path)
+        profile_id = db.create_profile(name, avatar_path, user.get("id") if user else "anonymous")
         
         return jsonify({"success": True, "id": profile_id, "name": name}), 201
     except Exception as e:
@@ -1796,7 +1903,8 @@ def create_profile():
 def get_profile(profile_id):
     """Get a specific profile"""
     try:
-        profile = db.get_profile(profile_id)
+        user = get_session_profile()
+        profile = db.get_profile(profile_id, user.get("id") if user else None)
         if not profile:
             return jsonify({"error": "Profile not found"}), 404
         return jsonify({"profile": profile})
@@ -1810,8 +1918,8 @@ def delete_profile(profile_id):
     try:
         if profile_id == 'default':
             return jsonify({"error": "Cannot delete default profile"}), 400
-            
-        success = db.delete_profile(profile_id)
+        user = get_session_profile()
+        success = db.delete_profile(profile_id, user.get("id") if user else None)
         if not success:
             return jsonify({"error": "Profile not found"}), 404
             
@@ -1847,6 +1955,9 @@ def import_profile(profile_id):
 def get_profile_settings(profile_id):
     """Get settings for a profile"""
     try:
+        user = get_session_profile()
+        if user and not db.profile_belongs_to_user(profile_id, user.get("id")):
+            return jsonify({"error": "forbidden"}), 403
         settings = db.get_profile_settings(profile_id)
         return jsonify({"settings": settings})
     except Exception as e:
@@ -1857,6 +1968,9 @@ def get_profile_settings(profile_id):
 def update_profile_settings(profile_id):
     """Update settings for a profile"""
     try:
+        user = get_session_profile()
+        if user and not db.profile_belongs_to_user(profile_id, user.get("id")):
+            return jsonify({"error": "forbidden"}), 403
         settings = request.json
         success = db.update_profile_settings(profile_id, settings)
         return jsonify({"success": success})
@@ -1870,11 +1984,12 @@ def update_profile_settings(profile_id):
 def get_conversations():
     """Get all conversations for a profile"""
     try:
-        if not get_session_profile():
+        user = get_session_profile()
+        if not user and not (app.debug or os.getenv("FLASK_DEBUG") == "1"):
             return jsonify({"error": "auth required"}), 401
-        profile_id = request.headers.get("X-Profile-ID", "default")
+        profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
         folder_id = request.args.get("folder_id")
-        conversations = db.get_conversations(profile_id, folder_id=folder_id)
+        conversations = db.get_conversations(profile_id, folder_id=folder_id, user_id=user.get("id") if user else None)
         return jsonify({"conversations": conversations})
     except Exception as e:
         logger.error(f"Failed to get conversations: {e}")
@@ -1884,10 +1999,11 @@ def get_conversations():
 def create_conversation():
     """Create a new conversation"""
     try:
-        if not get_session_profile():
+        user = get_session_profile()
+        if not user and not (app.debug or os.getenv("FLASK_DEBUG") == "1"):
             return jsonify({"error": "auth required"}), 401
         from datetime import datetime
-        profile_id = request.headers.get("X-Profile-ID", "default")
+        profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
         data = request.json or {}
         
         # Use provided ID from frontend
@@ -1896,7 +2012,7 @@ def create_conversation():
         folder_id = data.get("folder_id")
         
         # Create conversation in database with the provided ID
-        db.create_conversation(conversation_id, title, profile_id, folder_id)
+        db.create_conversation(conversation_id, title, profile_id, folder_id, user_id=user.get("id") if user else "anonymous")
         logger.info(f"Created conversation {conversation_id} for profile {profile_id}")
         return jsonify({"id": conversation_id, "title": title, "folder_id": folder_id}), 201
     except Exception as e:
@@ -1908,20 +2024,29 @@ def conversation_by_id(conversation_id):
     """Get or delete a specific conversation"""
     if request.method == "GET":
         try:
-            if not get_session_profile():
+            user = get_session_profile()
+            if not user and not (app.debug or os.getenv("FLASK_DEBUG") == "1"):
                 return jsonify({"error": "auth required"}), 401
-            conversation = db.get_conversation(conversation_id)
+            conversation = db.get_conversation(conversation_id, user.get("id") if user else None)
             if not conversation:
                 return jsonify({"error": "Conversation not found"}), 404
+            if user and not db.profile_belongs_to_user(conversation.get("profile_id", "default"), user.get("id")):
+                return jsonify({"error": "forbidden"}), 403
             return jsonify({"conversation": conversation})
         except Exception as e:
             logger.error(f"Failed to get conversation: {e}")
             return jsonify({"error": str(e)}), 500
     else:  # DELETE
         try:
-            if not get_session_profile():
+            user = get_session_profile()
+            if not user and not (app.debug or os.getenv("FLASK_DEBUG") == "1"):
                 return jsonify({"error": "auth required"}), 401
-            success = db.delete_conversation(conversation_id)
+            convo = db.get_conversation(conversation_id, user.get("id") if user else None)
+            if not convo:
+                return jsonify({"error": "Conversation not found"}), 404
+            if user and not db.profile_belongs_to_user(convo.get("profile_id", "default"), user.get("id")):
+                return jsonify({"error": "forbidden"}), 403
+            success = db.delete_conversation(conversation_id, user.get("id") if user else None)
             if not success:
                 return jsonify({"error": "Conversation not found"}), 404
             return jsonify({"success": True})
@@ -1933,9 +2058,10 @@ def conversation_by_id(conversation_id):
 def add_message(conversation_id):
     """Add a message to a conversation"""
     try:
-        if not get_session_profile():
+        user = get_session_profile()
+        if not user and not (app.debug or os.getenv("FLASK_DEBUG") == "1"):
             return jsonify({"error": "auth required"}), 401
-        profile_id = request.headers.get("X-Profile-ID", "default")
+        profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
         data = request.json
         
         message_id = data.get("id", str(int(datetime.now().timestamp() * 1000)))
@@ -1946,7 +2072,11 @@ def add_message(conversation_id):
         if not all([role, content]):
             return jsonify({"error": "Missing required fields"}), 400
         
-        message = db.add_message(message_id, conversation_id, role, content, model)
+        user = get_session_profile()
+        convo = db.get_conversation(conversation_id, user.get("id") if user else None)
+        if not convo or convo.get("profile_id") != profile_id:
+            return jsonify({"error": "Conversation not found"}), 404
+        message = db.add_message(message_id, conversation_id, role, content, model, user_id=user.get("id") if user else None)
         return jsonify({"success": True, "message": message}), 201
     except Exception as e:
         logger.error(f"Failed to add message: {e}")
@@ -1956,7 +2086,10 @@ def add_message(conversation_id):
 def import_conversation():
     """Import a conversation from JSON payload"""
     try:
-        profile_id = request.headers.get("X-Profile-ID", "default")
+        user = get_session_profile()
+        if not user and not (app.debug or os.getenv("FLASK_DEBUG") == "1"):
+            return jsonify({"error": "auth required"}), 401
+        profile_id = resolve_profile_id(request.headers.get("X-Profile-ID"))
         payload = request.json or {}
         convo = payload.get("conversation") or payload
         if not isinstance(convo, dict):
@@ -1965,7 +2098,7 @@ def import_conversation():
         conversation_id = convo.get("id") or str(int(datetime.now().timestamp() * 1000))
         title = convo.get("title") or "Imported Chat"
         folder_id = convo.get("folder_id")
-        db.create_conversation(conversation_id, title, profile_id, folder_id)
+        db.create_conversation(conversation_id, title, profile_id, folder_id, user_id=user.get("id") if user else "anonymous")
 
         for msg in convo.get("messages", []):
             db.add_message(
@@ -1973,7 +2106,8 @@ def import_conversation():
                 conversation_id,
                 msg.get("role", "assistant"),
                 msg.get("content", ""),
-                msg.get("model")
+                msg.get("model"),
+                user_id=user.get("id") if user else None
             )
 
         return jsonify({"success": True, "id": conversation_id})
@@ -2008,6 +2142,10 @@ def auth_verify():
         session_token = db.verify_login_code(email, code)
         if not session_token:
             return jsonify({"error": "Invalid or expired code"}), 400
+        # Ensure user has a default profile
+        user = db.get_user_by_session(session_token)
+        if user:
+            db.ensure_user_default_profile(user["id"], user.get("email", email))
         resp = jsonify({"success": True, "session": session_token})
         resp.set_cookie("session_token", session_token, httponly=True, samesite='Lax')
         return resp
@@ -2023,6 +2161,8 @@ def auth_me():
     user = db.get_user_by_session(token)
     if not user:
         return jsonify({"user": None})
+    # Ensure default profile exists for this user
+    db.ensure_user_default_profile(user["id"], user.get("email", "user"))
     return jsonify({"user": {"id": user["id"], "email": user["email"]}})
 
 

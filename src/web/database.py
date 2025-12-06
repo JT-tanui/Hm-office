@@ -28,7 +28,9 @@ class ConversationDB:
                 updated_at INTEGER NOT NULL,
                 use_as_context INTEGER DEFAULT 1,
                 summary TEXT DEFAULT NULL,
-                folder_id TEXT DEFAULT NULL
+                folder_id TEXT DEFAULT NULL,
+                profile_id TEXT DEFAULT 'default',
+                user_id TEXT DEFAULT 'anonymous'
             )
         ''')
         
@@ -49,6 +51,8 @@ class ConversationDB:
             cursor.execute("ALTER TABLE conversations ADD COLUMN archived INTEGER DEFAULT 0")
         if 'folder_id' not in columns:
             cursor.execute("ALTER TABLE conversations ADD COLUMN folder_id TEXT DEFAULT NULL")
+        if 'user_id' not in columns:
+            cursor.execute("ALTER TABLE conversations ADD COLUMN user_id TEXT DEFAULT 'anonymous'")
         
         # Messages table
         cursor.execute('''
@@ -60,6 +64,7 @@ class ConversationDB:
                 model TEXT,
                 created_at INTEGER NOT NULL,
                 pinned INTEGER DEFAULT 0,
+                user_id TEXT DEFAULT 'anonymous',
                 FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
             )
         ''')
@@ -67,6 +72,8 @@ class ConversationDB:
         message_columns = [column[1] for column in cursor.fetchall()]
         if 'pinned' not in message_columns:
             cursor.execute("ALTER TABLE messages ADD COLUMN pinned INTEGER DEFAULT 0")
+        if 'user_id' not in message_columns:
+            cursor.execute("ALTER TABLE messages ADD COLUMN user_id TEXT DEFAULT 'anonymous'")
         cursor.execute("PRAGMA table_info(rag_chunks)")
         rag_cols = [column[1] for column in cursor.fetchall()]
         if 'embedding' not in rag_cols:
@@ -134,7 +141,8 @@ class ConversationDB:
                 name TEXT NOT NULL,
                 avatar_path TEXT,
                 created_at INTEGER NOT NULL,
-                is_default INTEGER DEFAULT 0
+                is_default INTEGER DEFAULT 0,
+                user_id TEXT DEFAULT 'anonymous'
             )
         ''')
 
@@ -263,6 +271,12 @@ class ConversationDB:
         if 'profile_id' not in columns:
             cursor.execute("ALTER TABLE voice_memos ADD COLUMN profile_id TEXT DEFAULT 'default'")
 
+        # Add user_id to profiles if missing
+        cursor.execute("PRAGMA table_info(profiles)")
+        columns = [column[1] for column in cursor.fetchall()]
+        if 'user_id' not in columns:
+            cursor.execute("ALTER TABLE profiles ADD COLUMN user_id TEXT DEFAULT 'anonymous'")
+
         cursor.execute("PRAGMA table_info(profile_settings)")
         columns = [column[1] for column in cursor.fetchall()]
         if 'wake_word_sensitivity' not in columns:
@@ -275,8 +289,11 @@ class ConversationDB:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_memos_created ON voice_memos(created_at DESC)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_conversations_profile ON conversations(profile_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_memos_profile ON voice_memos(profile_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_conversations_folder ON conversations(folder_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_profiles_user ON profiles(user_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_rag_chunks_source ON rag_chunks(source_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_rag_chunks_profile ON rag_chunks(profile_id)')
         
@@ -379,15 +396,15 @@ class ConversationDB:
         conn.commit()
         conn.close()
     
-    def create_conversation(self, conversation_id: str, title: str = "New Chat", profile_id: str = "default", folder_id: Optional[str] = None) -> Dict:
+    def create_conversation(self, conversation_id: str, title: str = "New Chat", profile_id: str = "default", folder_id: Optional[str] = None, user_id: str = "anonymous") -> Dict:
         """Create a new conversation"""
         conn = self._connect()
         cursor = conn.cursor()
         
         now = int(datetime.now().timestamp() * 1000)
         cursor.execute(
-            'INSERT INTO conversations (id, title, created_at, updated_at, profile_id, folder_id) VALUES (?, ?, ?, ?, ?, ?)',
-            (conversation_id, title, now, now, profile_id, folder_id)
+            'INSERT INTO conversations (id, title, created_at, updated_at, profile_id, folder_id, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (conversation_id, title, now, now, profile_id, folder_id, user_id)
         )
         
         conn.commit()
@@ -399,11 +416,12 @@ class ConversationDB:
             'created_at': now,
             'updated_at': now,
             'profile_id': profile_id,
-            'folder_id': folder_id
+            'folder_id': folder_id,
+            'user_id': user_id
         }
     
-    def get_conversations(self, profile_id: str = "default", folder_id: Optional[str] = None) -> List[Dict]:
-        """Get all conversations for a profile with message counts"""
+    def get_conversations(self, profile_id: str = "default", folder_id: Optional[str] = None, user_id: Optional[str] = None) -> List[Dict]:
+        """Get all conversations for a profile (and user) with message counts"""
         conn = self._connect()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -415,6 +433,9 @@ class ConversationDB:
             WHERE c.profile_id = ?
         '''
         params: List = [profile_id]
+        if user_id:
+            query += ' AND c.user_id = ?'
+            params.append(user_id)
         if folder_id:
             query += ' AND c.folder_id = ?'
             params.append(folder_id)
@@ -440,14 +461,17 @@ class ConversationDB:
         self.create_conversation(conversation_id, title, profile_id)
         return conversation_id
     
-    def get_conversation(self, conversation_id: str) -> Optional[Dict]:
+    def get_conversation(self, conversation_id: str, user_id: Optional[str] = None) -> Optional[Dict]:
         """Get a single conversation with its messages"""
         conn = self._connect()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
         # Get conversation
-        cursor.execute('SELECT * FROM conversations WHERE id = ?', (conversation_id,))
+        if user_id:
+            cursor.execute('SELECT * FROM conversations WHERE id = ? AND user_id = ?', (conversation_id, user_id))
+        else:
+            cursor.execute('SELECT * FROM conversations WHERE id = ?', (conversation_id,))
         conv_row = cursor.fetchone()
         
         if not conv_row:
@@ -468,7 +492,7 @@ class ConversationDB:
         conn.close()
         return conversation
     
-    def update_conversation(self, conversation_id: str, title: str = None) -> bool:
+    def update_conversation(self, conversation_id: str, title: str = None, user_id: Optional[str] = None) -> bool:
         """Update conversation title"""
         conn = self._connect()
         cursor = conn.cursor()
@@ -476,15 +500,27 @@ class ConversationDB:
         now = int(datetime.now().timestamp() * 1000)
         
         if title:
-            cursor.execute(
-                'UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?',
-                (title, now, conversation_id)
-            )
+            if user_id:
+                cursor.execute(
+                    'UPDATE conversations SET title = ?, updated_at = ? WHERE id = ? AND user_id = ?',
+                    (title, now, conversation_id, user_id)
+                )
+            else:
+                cursor.execute(
+                    'UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?',
+                    (title, now, conversation_id)
+                )
         else:
-            cursor.execute(
-                'UPDATE conversations SET updated_at = ? WHERE id = ?',
-                (now, conversation_id)
-            )
+            if user_id:
+                cursor.execute(
+                    'UPDATE conversations SET updated_at = ? WHERE id = ? AND user_id = ?',
+                    (now, conversation_id, user_id)
+                )
+            else:
+                cursor.execute(
+                    'UPDATE conversations SET updated_at = ? WHERE id = ?',
+                    (now, conversation_id)
+                )
         
         success = cursor.rowcount > 0
         conn.commit()
@@ -492,12 +528,15 @@ class ConversationDB:
         
         return success
     
-    def delete_conversation(self, conversation_id: str) -> bool:
+    def delete_conversation(self, conversation_id: str, user_id: Optional[str] = None) -> bool:
         """Delete a conversation and all its messages"""
         conn = self._connect()
         cursor = conn.cursor()
         
-        cursor.execute('DELETE FROM conversations WHERE id = ?', (conversation_id,))
+        if user_id:
+            cursor.execute('DELETE FROM conversations WHERE id = ? AND user_id = ?', (conversation_id, user_id))
+        else:
+            cursor.execute('DELETE FROM conversations WHERE id = ?', (conversation_id,))
         success = cursor.rowcount > 0
         
         conn.commit()
@@ -505,16 +544,22 @@ class ConversationDB:
         
         return success
     
-    def add_message(self, message_id: str, conversation_id: str, role: str, content: str, model: str = None, pinned: bool = False) -> Dict:
+    def add_message(self, message_id: str, conversation_id: str, role: str, content: str, model: str = None, pinned: bool = False, user_id: Optional[str] = None) -> Dict:
         """Add a message to a conversation"""
         conn = self._connect()
         cursor = conn.cursor()
         
         now = int(datetime.now().timestamp() * 1000)
+
+        if user_id:
+            cursor.execute('SELECT 1 FROM conversations WHERE id = ? AND user_id = ?', (conversation_id, user_id))
+            if not cursor.fetchone():
+                conn.close()
+                raise ValueError("Conversation not found for user")
         
         cursor.execute(
-            'INSERT INTO messages (id, conversation_id, role, content, model, created_at, pinned) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            (message_id, conversation_id, role, content, model, now, 1 if pinned else 0)
+            'INSERT INTO messages (id, conversation_id, role, content, model, created_at, pinned, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            (message_id, conversation_id, role, content, model, now, 1 if pinned else 0, user_id or 'anonymous')
         )
         
         # Update conversation updated_at
@@ -693,10 +738,13 @@ class ConversationDB:
         conn.close()
         return {"id": source_id, "profile_id": profile_id, "name": name, "type": type_, "status": status, "meta": meta or {}, "created_at": now, "updated_at": now}
 
-    def delete_rag_source(self, source_id: str) -> bool:
+    def delete_rag_source(self, source_id: str, profile_id: Optional[str] = None) -> bool:
         conn = self._connect()
         cursor = conn.cursor()
-        cursor.execute('DELETE FROM rag_sources WHERE id = ?', (source_id,))
+        if profile_id:
+            cursor.execute('DELETE FROM rag_sources WHERE id = ? AND profile_id = ?', (source_id, profile_id))
+        else:
+            cursor.execute('DELETE FROM rag_sources WHERE id = ?', (source_id,))
         deleted = cursor.rowcount > 0
         conn.commit()
         conn.close()
@@ -1251,7 +1299,7 @@ class ConversationDB:
         conn.close()
         return deleted
 
-    def search_voice_memos(self, query: str, limit: int = 20) -> List[Dict]:
+    def search_voice_memos(self, query: str, limit: int = 20, profile_id: str = "default") -> List[Dict]:
         """Search voice memos using FTS5"""
         conn = self._connect()
         conn.row_factory = sqlite3.Row
@@ -1262,10 +1310,10 @@ class ConversationDB:
             SELECT m.*, snippet(memos_fts, 1, '<b>', '</b>', '...', 64) as snippet
             FROM voice_memos m
             JOIN memos_fts fts ON m.rowid = fts.rowid
-            WHERE fts MATCH ?
+            WHERE fts MATCH ? AND m.profile_id = ?
             ORDER BY m.created_at DESC
             LIMIT ?
-        ''', (query, limit))
+        ''', (query, profile_id, limit))
         
         results = []
         for row in cursor.fetchall():
@@ -1420,32 +1468,38 @@ class ConversationDB:
 
     # ================= PROFILES =================
 
-    def get_profiles(self) -> List[Dict]:
-        """Get all profiles"""
+    def get_profiles(self, user_id: Optional[str] = None) -> List[Dict]:
+        """Get all profiles for a user"""
         conn = self._connect()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        
-        cursor.execute('SELECT * FROM profiles ORDER BY created_at ASC')
+
+        if user_id:
+            cursor.execute('SELECT * FROM profiles WHERE user_id = ? ORDER BY created_at ASC', (user_id,))
+        else:
+            cursor.execute('SELECT * FROM profiles ORDER BY created_at ASC')
         results = [dict(row) for row in cursor.fetchall()]
         
         conn.close()
         return results
 
-    def get_profile(self, profile_id: str) -> Optional[Dict]:
-        """Get a specific profile"""
+    def get_profile(self, profile_id: str, user_id: Optional[str] = None) -> Optional[Dict]:
+        """Get a specific profile, optionally scoped to a user"""
         conn = self._connect()
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        
-        cursor.execute('SELECT * FROM profiles WHERE id = ?', (profile_id,))
+
+        if user_id:
+            cursor.execute('SELECT * FROM profiles WHERE id = ? AND user_id = ?', (profile_id, user_id))
+        else:
+            cursor.execute('SELECT * FROM profiles WHERE id = ?', (profile_id,))
         row = cursor.fetchone()
         
         conn.close()
         return dict(row) if row else None
 
-    def create_profile(self, name: str, avatar_path: str = "") -> str:
-        """Create a new profile"""
+    def create_profile(self, name: str, avatar_path: str = "", user_id: str = "anonymous") -> str:
+        """Create a new profile for a user"""
         conn = self._connect()
         cursor = conn.cursor()
         
@@ -1453,8 +1507,8 @@ class ConversationDB:
         created_at = int(datetime.now().timestamp())
         
         cursor.execute(
-            'INSERT INTO profiles (id, name, avatar_path, created_at, is_default) VALUES (?, ?, ?, ?, ?)',
-            (profile_id, name, avatar_path, created_at, 0)
+            'INSERT INTO profiles (id, name, avatar_path, created_at, is_default, user_id) VALUES (?, ?, ?, ?, ?, ?)',
+            (profile_id, name, avatar_path, created_at, 0, user_id)
         )
         
         # Create default settings for this profile
@@ -1467,18 +1521,53 @@ class ConversationDB:
         conn.close()
         return profile_id
 
-    def delete_profile(self, profile_id: str) -> bool:
-        """Delete a profile
-"""
+    def delete_profile(self, profile_id: str, user_id: Optional[str] = None) -> bool:
+        """Delete a profile"""
         conn = self._connect()
         cursor = conn.cursor()
-        
-        cursor.execute('DELETE FROM profiles WHERE id = ?', (profile_id,))
+
+        if user_id:
+            cursor.execute('DELETE FROM profiles WHERE id = ? AND user_id = ?', (profile_id, user_id))
+        else:
+            cursor.execute('DELETE FROM profiles WHERE id = ?', (profile_id,))
         deleted = cursor.rowcount > 0
-        
+
         conn.commit()
         conn.close()
         return deleted
+
+    def ensure_user_default_profile(self, user_id: str, email: str) -> str:
+        """Ensure a default profile exists for a given user; return its id"""
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('SELECT id FROM profiles WHERE user_id = ? ORDER BY created_at ASC LIMIT 1', (user_id,))
+        row = cursor.fetchone()
+        if row:
+            conn.close()
+            return row['id']
+
+        profile_id = str(int(datetime.now().timestamp() * 1000))
+        created_at = int(datetime.now().timestamp())
+        cursor.execute(
+            'INSERT INTO profiles (id, name, avatar_path, created_at, is_default, user_id) VALUES (?, ?, ?, ?, ?, ?)',
+            (profile_id, email.split("@")[0] if "@" in email else email, "", created_at, 1, user_id)
+        )
+        cursor.execute(
+            'INSERT INTO profile_settings (profile_id) VALUES (?)',
+            (profile_id,)
+        )
+        conn.commit()
+        conn.close()
+        return profile_id
+
+    def profile_belongs_to_user(self, profile_id: str, user_id: str) -> bool:
+        conn = self._connect()
+        cursor = conn.cursor()
+        cursor.execute('SELECT 1 FROM profiles WHERE id = ? AND user_id = ?', (profile_id, user_id))
+        ok = cursor.fetchone() is not None
+        conn.close()
+        return ok
 
     # ================= INTEGRATIONS =================
 
