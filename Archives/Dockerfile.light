@@ -1,0 +1,45 @@
+# Lightweight Backend Dockerfile for resource-constrained servers
+# Optimized for Leonel Group DigitalOcean droplet (512MB RAM)
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install minimal system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Copy requirements first for layer caching
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir \
+    flask \
+    numpy \
+    python-dotenv \
+    requests \
+    scipy \
+    werkzeug \
+    && rm -rf ~/.cache/pip
+
+# Copy application code
+COPY src/ ./src/
+
+# Create directories
+RUN mkdir -p src/web/static/audio data
+
+# Expose port
+EXPOSE 5000
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV FLASK_ENV=production
+ENV OLLAMA_HOST=http://host.docker.internal:11434
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:5000/health || exit 1
+
+# Run the application with reduced workers for memory conservation
+CMD ["python", "-u", "src/web/app.py"]

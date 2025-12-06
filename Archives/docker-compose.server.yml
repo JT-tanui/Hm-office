@@ -1,0 +1,62 @@
+version: '3.8'
+
+# Docker Compose for Leonel Group Server (138.68.59.201)
+# Subdomain: assistant.leonelgroup.co.ke
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: assistant-backend
+    restart: unless-stopped
+    ports:
+      - "3001:5000"
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - FLASK_ENV=production
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data/conversations.db:/app/conversations.db
+      - ./data/audio:/app/src/web/static/audio
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        - NEXT_PUBLIC_API_URL=https://assistant.leonelgroup.co.ke/api
+    container_name: assistant-frontend
+    restart: unless-stopped
+    ports:
+      - "3002:3000"
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_API_URL=https://assistant.leonelgroup.co.ke/api
+    depends_on:
+      backend:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+
+volumes:
+  conversations-data:
+  audio-data:
